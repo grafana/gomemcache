@@ -28,6 +28,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thanos-io/thanos/pkg/pool"
 )
 
 const testServer = "localhost:11211"
@@ -296,6 +298,25 @@ func BenchmarkScanGetResponseLine(b *testing.B) {
 	var it Item
 	for i := 0; i < b.N; i++ {
 		_, err := scanGetResponseLine(line, &it)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParseGetResponse(b *testing.B) {
+	response := "VALUE foobar1234 0 5 1234\r\nhello\r\nEND\r\n"
+	pool, err := pool.NewBucketedBytes(2, 1e6, 3, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	c := &Client{
+		Pool: pool,
+	}
+	for i := 0; i < b.N; i++ {
+		err = c.parseGetResponse(bufio.NewReader(strings.NewReader(response)), func(it *Item) {
+			c.Pool.Put(&it.Value)
+		})
 		if err != nil {
 			b.Fatal(err)
 		}
