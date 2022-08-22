@@ -29,8 +29,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/pool"
 )
 
 // Similar to:
@@ -148,7 +146,7 @@ type Client struct {
 	// be set to a number higher than your peak parallel requests.
 	MaxIdleConns int
 
-	Pool pool.Bytes
+	Pool BytesPool
 
 	selector ServerSelector
 
@@ -183,6 +181,14 @@ type conn struct {
 	rw   *bufio.ReadWriter
 	addr net.Addr
 	c    *Client
+}
+
+// BytesPool is a pool of bytes that can be reused.
+type BytesPool interface {
+	// Get returns a new byte slice that fits the given size.
+	Get(sz int) (*[]byte, error)
+	// Put returns a byte slice to the right bucket in the pool.
+	Put(b *[]byte)
 }
 
 // release returns this connection back to the client's free pool

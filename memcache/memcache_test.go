@@ -26,10 +26,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/pool"
 )
 
 const testServer = "localhost:11211"
@@ -306,13 +305,10 @@ func BenchmarkScanGetResponseLine(b *testing.B) {
 
 func BenchmarkParseGetResponse(b *testing.B) {
 	response := "VALUE foobar1234 0 5 1234\r\nhello\r\nEND\r\n"
-	pool, err := pool.NewBucketedBytes(2, 1e6, 3, 0)
-	if err != nil {
-		b.Fatal(err)
-	}
 	c := &Client{
-		Pool: pool,
+		Pool: newTestPool(5),
 	}
+	var err error
 	for i := 0; i < b.N; i++ {
 		err = c.parseGetResponse(bufio.NewReader(strings.NewReader(response)), func(it *Item) {
 			c.Pool.Put(&it.Value)
@@ -321,4 +317,27 @@ func BenchmarkParseGetResponse(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+type testPool struct {
+	pool sync.Pool
+}
+
+func newTestPool(dataSize int) BytesPool {
+	return &testPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 0, dataSize+2)
+				return &b
+			},
+		},
+	}
+}
+
+func (p *testPool) Get(sz int) (*[]byte, error) {
+	return p.pool.Get().(*[]byte), nil
+}
+
+func (p *testPool) Put(b *[]byte) {
+	p.pool.Put(b)
 }
