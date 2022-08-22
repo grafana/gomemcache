@@ -304,9 +304,10 @@ func BenchmarkScanGetResponseLine(b *testing.B) {
 }
 
 func BenchmarkParseGetResponse(b *testing.B) {
-	response := strings.NewReader("VALUE foobar1234 0 5 1234\r\nhello\r\nEND\r\n")
+	valueSize := 500
+	response := strings.NewReader(fmt.Sprintf("VALUE foobar1234 0 %v 1234\r\n%s\r\nEND\r\n", valueSize, strings.Repeat("a", valueSize)))
 	c := &Client{
-		Pool: newTestPool(5),
+		Pool: newTestPool(valueSize),
 	}
 	var reader = bufio.NewReader(response)
 	var err error
