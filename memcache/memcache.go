@@ -185,9 +185,10 @@ type conn struct {
 
 // BytesPool is a pool of bytes that can be reused.
 type BytesPool interface {
-	// Get returns a new byte slice that fits the given size.
+	// Get returns a new byte slice that has a capacity at least the same as the
+	// requested size.
 	Get(sz int) (*[]byte, error)
-	// Put returns a byte slice to the right bucket in the pool.
+	// Put returns a byte slice to the pool.
 	Put(b *[]byte)
 }
 
