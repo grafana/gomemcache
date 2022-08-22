@@ -304,18 +304,21 @@ func BenchmarkScanGetResponseLine(b *testing.B) {
 }
 
 func BenchmarkParseGetResponse(b *testing.B) {
-	response := "VALUE foobar1234 0 5 1234\r\nhello\r\nEND\r\n"
+	response := strings.NewReader("VALUE foobar1234 0 5 1234\r\nhello\r\nEND\r\n")
 	c := &Client{
 		Pool: newTestPool(5),
 	}
+	var reader = bufio.NewReader(response)
 	var err error
 	for i := 0; i < b.N; i++ {
-		err = c.parseGetResponse(bufio.NewReader(strings.NewReader(response)), func(it *Item) {
+		err = c.parseGetResponse(reader, func(it *Item) {
 			c.Pool.Put(&it.Value)
 		})
 		if err != nil {
 			b.Fatal(err)
 		}
+		response.Seek(0, 0)
+		reader.Reset(response)
 	}
 }
 
