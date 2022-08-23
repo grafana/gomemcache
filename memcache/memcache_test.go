@@ -307,7 +307,7 @@ func BenchmarkParseGetResponse(b *testing.B) {
 	valueSize := 500
 	response := strings.NewReader(fmt.Sprintf("VALUE foobar1234 0 %v 1234\r\n%s\r\nEND\r\n", valueSize, strings.Repeat("a", valueSize)))
 	c := &Client{
-		Pool: newTestPool(valueSize),
+		Pool: newTestPool(valueSize + 2),
 	}
 	var reader = bufio.NewReader(response)
 	var err error
@@ -331,7 +331,7 @@ func newTestPool(dataSize int) BytesPool {
 	return &testPool{
 		pool: sync.Pool{
 			New: func() interface{} {
-				b := make([]byte, 0, dataSize+2)
+				b := make([]byte, 0, dataSize)
 				return &b
 			},
 		},
