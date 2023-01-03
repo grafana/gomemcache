@@ -357,5 +357,6 @@ func (p *testAllocator) Get(sz int) []byte {
 }
 
 func (p *testAllocator) Put(b []byte) {
+	//nolint:staticcheck
 	p.pool.Put(b)
 }
