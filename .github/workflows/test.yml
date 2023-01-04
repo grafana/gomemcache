@@ -13,7 +13,8 @@ jobs:
 
       - name: Check out code
         uses: actions/checkout@v3
-
+      - name: Install Memcached
+        run: apt-get install -y memcached
       - name: Run Tests
         run: go test -v -race ./...
 
