@@ -1,8 +1,10 @@
 package memcache
 
+var nopAllocator = &defaultAllocator{}
+
 func newOptions(opts ...Option) *Options {
 	o := &Options{
-		Alloc: &defaultAllocator{},
+		Alloc: nopAllocator,
 	}
 
 	for _, opt := range opts {
