@@ -315,7 +315,7 @@ func BenchmarkParseGetResponse(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		err := c.parseGetResponse(reader, opts, func(it *Item) {
-			opts.Alloc.Put(it.Value)
+			opts.Alloc.Put(&it.Value)
 		})
 		if err != nil {
 			b.Fatal(err)
@@ -339,24 +339,29 @@ func newTestAllocator(dataSize int) Allocator {
 		expectedSize: dataSize,
 		pool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, dataSize)
+				b := make([]byte, dataSize)
+				return &b
 			},
 		},
 	}
 }
 
-func (p *testAllocator) Get(sz int) []byte {
-	b := p.pool.Get().([]byte)
+func (p *testAllocator) Get(sz int) *[]byte {
+	bufPtr := p.pool.Get().(*[]byte)
 	// NOTE: This assumes all entries in the pool are the same, correct size. This
 	// is fine because we are only using these values to benchmark the same data over
 	// and over again.
 	if p.expectedSize != sz {
 		panic("unexpected allocation size in test allocator")
 	}
-	return b[:sz]
+
+	// Dereference so that we can force the correct size here. The client resizes the
+	// buffer during normal operation to drop the trailing '\r\n' from the result returned
+	// to callers, so we have to undo that.
+	buf := (*bufPtr)[:sz]
+	return &buf
 }
 
-func (p *testAllocator) Put(b []byte) {
-	//nolint:staticcheck
+func (p *testAllocator) Put(b *[]byte) {
 	p.pool.Put(b)
 }

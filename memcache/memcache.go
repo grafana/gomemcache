@@ -511,14 +511,15 @@ func (c *Client) parseGetResponse(r *bufio.Reader, opts *Options, cb func(*Item)
 			return err
 		}
 		buffSize := size + 2
-		it.Value = opts.Alloc.Get(buffSize)
+		buff := opts.Alloc.Get(buffSize)
+		it.Value = *buff
 		_, err = io.ReadFull(r, it.Value)
 		if err != nil {
-			opts.Alloc.Put(it.Value)
+			opts.Alloc.Put(buff)
 			return err
 		}
 		if !bytes.HasSuffix(it.Value, crlf) {
-			opts.Alloc.Put(it.Value)
+			opts.Alloc.Put(buff)
 			return fmt.Errorf("memcache: corrupt get result read")
 		}
 		it.Value = it.Value[:size]

@@ -39,19 +39,20 @@ func WithAllocator(alloc Allocator) Option {
 // used, when not otherwise overridden, uses `make` and relies on GC for cleanup.
 type Allocator interface {
 	// Get returns a byte slice with sz length and at least sz capacity.
-	Get(sz int) []byte
+	Get(sz int) *[]byte
 	// Put returns the byte slice to the underlying allocator. The Client will
 	// only call this method during error handling when allocated values are not
 	// returned to the caller as cache results.
-	Put(b []byte)
+	Put(b *[]byte)
 }
 
 type defaultAllocator struct{}
 
-func (d defaultAllocator) Get(sz int) []byte {
-	return make([]byte, sz)
+func (d defaultAllocator) Get(sz int) *[]byte {
+	b := make([]byte, sz)
+	return &b
 }
 
-func (d defaultAllocator) Put(_ []byte) {
+func (d defaultAllocator) Put(_ *[]byte) {
 	// no-op
 }
