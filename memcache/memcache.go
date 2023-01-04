@@ -512,7 +512,7 @@ func (c *Client) parseGetResponse(r *bufio.Reader, opts *Options, cb func(*Item)
 		}
 		buffSize := size + 2
 		buff := opts.Alloc.Get(buffSize)
-		it.Value = *buff
+		it.Value = (*buff)[:buffSize]
 		_, err = io.ReadFull(r, it.Value)
 		if err != nil {
 			opts.Alloc.Put(buff)

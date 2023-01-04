@@ -38,7 +38,8 @@ func WithAllocator(alloc Allocator) Option {
 // used by callers to implement arena-style memory management. The default implementation
 // used, when not otherwise overridden, uses `make` and relies on GC for cleanup.
 type Allocator interface {
-	// Get returns a byte slice with sz length and at least sz capacity.
+	// Get returns a byte slice with at least sz capacity. Length of the slice is
+	// not guaranteed and so must be asserted by callers (the Client).
 	Get(sz int) *[]byte
 	// Put returns the byte slice to the underlying allocator. The Client will
 	// only call this method during error handling when allocated values are not

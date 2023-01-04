@@ -347,7 +347,6 @@ func newTestAllocator(dataSize int) Allocator {
 }
 
 func (p *testAllocator) Get(sz int) *[]byte {
-	bufPtr := p.pool.Get().(*[]byte)
 	// NOTE: This assumes all entries in the pool are the same, correct size. This
 	// is fine because we are only using these values to benchmark the same data over
 	// and over again.
@@ -355,11 +354,8 @@ func (p *testAllocator) Get(sz int) *[]byte {
 		panic("unexpected allocation size in test allocator")
 	}
 
-	// Dereference so that we can force the correct size here. The client resizes the
-	// buffer during normal operation to drop the trailing '\r\n' from the result returned
-	// to callers, so we have to undo that.
-	buf := (*bufPtr)[:sz]
-	return &buf
+	bufPtr := p.pool.Get().(*[]byte)
+	return bufPtr
 }
 
 func (p *testAllocator) Put(b *[]byte) {
