@@ -91,15 +91,13 @@ func testWithClient(t *testing.T, c *Client) {
 	}
 	mustSet := mustSetF(t, c)
 
-	t.Run("set", func(t *testing.T) {
+	t.Run("get and set", func(t *testing.T) {
 		foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
 		err := c.Set(foo)
 		checkErr(err, "first set(foo): %v", err)
 		err = c.Set(foo)
 		checkErr(err, "second set(foo): %v", err)
-	})
 
-	t.Run("get", func(t *testing.T) {
 		it, err := c.Get("foo")
 		checkErr(err, "get(foo): %v", err)
 		if it.Key != "foo" {
