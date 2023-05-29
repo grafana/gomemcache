@@ -945,7 +945,6 @@ func BenchmarkGetMulti(b *testing.B) {
 			Value:      []byte(strings.Repeat("bench payload", 10)),
 			Flags:      0,
 			Expiration: 30,
-			casid:      0,
 		})
 		if err != nil {
 			b.Fatal("Could not set item for test server: ", err)
