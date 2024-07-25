@@ -482,6 +482,73 @@ func (c *Client) Get(key string, opts ...Option) (item *Item, err error) {
 	return
 }
 
+type Stats struct {
+	Items     uint64
+	GetHits   uint64
+	GetMisses uint64
+}
+
+// Stats return some statistics about the cache.
+func (c *Client) Stats() (*Stats, error) {
+	stats := &Stats{}
+	err := c.selector.Each(func(addr net.Addr) error {
+		return c.withAddrRw(addr, func(conn *conn) error {
+			rw := conn.rw
+			if _, err := fmt.Fprintf(rw, "stats\r\n"); err != nil {
+				return err
+			}
+			if err := rw.Flush(); err != nil {
+				return err
+			}
+			return c.parseStatsResponse(rw.Reader, stats)
+		})
+	})
+	return stats, err
+}
+
+func (c *Client) parseStatsResponse(r *bufio.Reader, stats *Stats) error {
+	for {
+		line, err := r.ReadSlice('\n')
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(line, resultEnd) {
+			return nil
+		}
+		if !bytes.HasPrefix(line, []byte("STAT ")) {
+			return fmt.Errorf("memcache: unexpected line in stats response: %q", line)
+		}
+		parts := bytes.Split(line[5:len(line)-2], []byte(" "))
+		if len(parts) != 3 {
+			return fmt.Errorf("memcache: unexpected line in stats response: %q", line)
+		}
+
+		switch string(parts[1]) {
+		case "curr_items":
+			items, err := strconv.ParseUint(string(parts[2]), 10, 64)
+			if err != nil {
+				return err
+			}
+
+			stats.Items += items
+		case "get_hits":
+			hits, err := strconv.ParseUint(string(parts[2]), 10, 64)
+			if err != nil {
+				return err
+			}
+
+			stats.GetHits += hits
+		case "get_misses":
+			misses, err := strconv.ParseUint(string(parts[2]), 10, 64)
+			if err != nil {
+				return err
+			}
+
+			stats.GetMisses += misses
+		}
+	}
+}
+
 // Touch updates the expiry for the given key. The seconds parameter is either
 // a Unix timestamp or, if seconds is less than 1 month, the number of seconds
 // into the future at which time the item will expire. Zero means the item has
