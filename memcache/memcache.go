@@ -639,7 +639,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 				err = ge
 			}
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("memcache GetMulti: %w", ctx.Err())
 		}
 	}
 	return m, err
