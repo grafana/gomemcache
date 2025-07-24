@@ -20,6 +20,7 @@ package memcache
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -596,7 +597,7 @@ func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) e
 // items may have fewer elements than the input slice, due to memcache
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
-func (c *Client) GetMulti(keys []string, opts ...Option) (map[string]*Item, error) {
+func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (map[string]*Item, error) {
 	options := newOptions(opts...)
 
 	var lk sync.Mutex
@@ -623,14 +624,22 @@ func (c *Client) GetMulti(keys []string, opts ...Option) (map[string]*Item, erro
 	for addr, keys := range keyMap {
 		go func(addr net.Addr, keys []string) {
 			err := c.getFromAddr(addr, keys, options, addItemToMap)
-			ch <- err
+			select {
+			case ch <- err:
+			case <-ctx.Done():
+			}
 		}(addr, keys)
 	}
 
 	var err error
-	for range keyMap {
-		if ge := <-ch; ge != nil {
-			err = ge
+	for i := 0; i < len(keyMap); i++ {
+		select {
+		case ge := <-ch:
+			if ge != nil {
+				err = ge
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	return m, err

@@ -19,6 +19,7 @@ package memcache
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -166,7 +167,7 @@ func testWithClient(t *testing.T, c *Client) {
 	})
 
 	t.Run("getmulti", func(t *testing.T) {
-		m, err := c.GetMulti([]string{"foo", "bar"})
+		m, err := c.GetMulti(context.Background(), []string{"foo", "bar"})
 		checkErr(err, "GetMulti: %v", err)
 		if g, e := len(m), 2; g != e {
 			t.Errorf("GetMulti: got len(map) = %d, want = %d", g, e)
@@ -182,6 +183,19 @@ func testWithClient(t *testing.T, c *Client) {
 		}
 		if g, e := string(m["bar"].Value), "barval"; g != e {
 			t.Errorf("GetMulti: bar: got %q, want %q", g, e)
+		}
+	})
+
+	t.Run("getmulti context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+		
+		m, err := c.GetMulti(ctx, []string{"foo", "bar"})
+		if err != context.Canceled {
+			t.Errorf("GetMulti with cancelled context: got err=%v, want=%v", err, context.Canceled)
+		}
+		if m != nil {
+			t.Errorf("GetMulti with cancelled context: got map=%v, want=nil", m)
 		}
 	})
 
@@ -561,7 +575,7 @@ func BenchmarkGetMulti(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = c.GetMulti(keys)
+		_, _ = c.GetMulti(context.Background(), keys)
 	}
 }
 
