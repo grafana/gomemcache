@@ -20,6 +20,7 @@ package memcache
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -191,8 +192,8 @@ func testWithClient(t *testing.T, c *Client) {
 		cancel() // Cancel immediately
 		
 		m, err := c.GetMulti(ctx, []string{"foo", "bar"})
-		if err != context.Canceled {
-			t.Errorf("GetMulti with cancelled context: got err=%v, want=%v", err, context.Canceled)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("GetMulti with cancelled context: got err=%v, want wrapped context.Canceled", err)
 		}
 		if m != nil {
 			t.Errorf("GetMulti with cancelled context: got map=%v, want=nil", m)
