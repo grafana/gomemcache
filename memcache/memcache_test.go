@@ -190,13 +190,50 @@ func testWithClient(t *testing.T, c *Client) {
 	t.Run("getmulti context cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // Cancel immediately
-		
+
 		m, err := c.GetMulti(ctx, []string{"foo", "bar"})
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("GetMulti with cancelled context: got err=%v, want wrapped context.Canceled", err)
 		}
 		if m != nil {
 			t.Errorf("GetMulti with cancelled context: got map=%v, want=nil", m)
+		}
+	})
+
+	t.Run("getmulti context cancellation during response parsing", func(t *testing.T) {
+		// Set up items with some data
+		mustSet(&Item{Key: "large1", Value: make([]byte, 1000)})
+		mustSet(&Item{Key: "large2", Value: make([]byte, 1000)})
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Start GetMulti in a goroutine
+		resultCh := make(chan map[string]*Item, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			m, err := c.GetMulti(ctx, []string{"large1", "large2"})
+			resultCh <- m
+			errCh <- err
+		}()
+
+		// Cancel context immediately to trigger cancellation during parsing
+		cancel()
+
+		// Should get cancelled context error
+		err := <-errCh
+		m := <-resultCh
+
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("GetMulti with cancelled context during parsing: got err=%v, want wrapped context.Canceled", err)
+		}
+		if m != nil {
+			t.Errorf("GetMulti with cancelled context during parsing: got map=%v, want=nil", m)
+		}
+
+		// Connection should still be usable - test with a simple get
+		_, err = c.Get("foo")
+		if err != nil && err != ErrCacheMiss {
+			t.Errorf("Connection should be usable after cancelled GetMulti: got err=%v", err)
 		}
 	})
 
@@ -642,7 +679,7 @@ func BenchmarkParseGetResponse(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
-		err := c.parseGetResponse(reader, cn, opts, func(it *Item) {
+		err := c.parseGetResponse(context.Background(), reader, cn, opts, func(it *Item) {
 			opts.Alloc.Put(&it.Value)
 		})
 		if err != nil {

@@ -456,7 +456,7 @@ func (c *Client) FlushAll() error {
 func (c *Client) Get(key string, opts ...Option) (item *Item, err error) {
 	options := newOptions(opts...)
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.getFromAddr(addr, []string{key}, options, func(it *Item) { item = it })
+		return c.getFromAddr(context.Background(), addr, []string{key}, options, func(it *Item) { item = it })
 	})
 	if err == nil && item == nil {
 		err = ErrCacheMiss
@@ -501,7 +501,7 @@ func (c *Client) withKeyRw(key string, fn func(*conn) error) error {
 	})
 }
 
-func (c *Client) getFromAddr(addr net.Addr, keys []string, opts *Options, cb func(*Item)) error {
+func (c *Client) getFromAddr(ctx context.Context, addr net.Addr, keys []string, opts *Options, cb func(*Item)) error {
 	return c.withAddrRw(addr, func(conn *conn) error {
 		rw := conn.rw
 		if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
@@ -510,7 +510,7 @@ func (c *Client) getFromAddr(addr net.Addr, keys []string, opts *Options, cb fun
 		if err := rw.Flush(); err != nil {
 			return err
 		}
-		if err := c.parseGetResponse(rw.Reader, conn, opts, cb); err != nil {
+		if err := c.parseGetResponse(ctx, rw.Reader, conn, opts, cb); err != nil {
 			return err
 		}
 		return nil
@@ -623,7 +623,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 	ch := make(chan error, buffered)
 	for addr, keys := range keyMap {
 		go func(addr net.Addr, keys []string) {
-			err := c.getFromAddr(addr, keys, options, addItemToMap)
+			err := c.getFromAddr(ctx, addr, keys, options, addItemToMap)
 			select {
 			case ch <- err:
 			case <-ctx.Done():
@@ -647,7 +647,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
-func (c *Client) parseGetResponse(r *bufio.Reader, conn *conn, opts *Options, cb func(*Item)) error {
+func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *conn, opts *Options, cb func(*Item)) error {
 	for {
 		// extend deadline before each additional call, otherwise all cumulative calls use the same overall deadline
 		conn.extendDeadline()
@@ -665,6 +665,20 @@ func (c *Client) parseGetResponse(r *bufio.Reader, conn *conn, opts *Options, cb
 			return err
 		}
 		buffSize := size + 2
+
+		// Check if context is cancelled before allocating memory
+		select {
+		case <-ctx.Done():
+			// Still need to read the data to keep connection in valid state
+			_, err = io.CopyN(io.Discard, r, int64(buffSize))
+			if err != nil {
+				return err
+			}
+			// Continue reading without processing to maintain connection state
+			continue
+		default:
+		}
+
 		buff := opts.Alloc.Get(buffSize)
 		it.Value = (*buff)[:buffSize]
 		_, err = io.ReadFull(r, it.Value)
