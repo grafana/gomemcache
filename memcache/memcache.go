@@ -598,6 +598,13 @@ func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) e
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
 func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (map[string]*Item, error) {
+	// Check if context is already cancelled before doing any work
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("memcache GetMulti: %w", ctx.Err())
+	default:
+	}
+
 	options := newOptions(opts...)
 
 	var lk sync.Mutex
