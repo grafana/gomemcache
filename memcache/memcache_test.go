@@ -23,12 +23,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -197,6 +200,47 @@ func testWithClient(t *testing.T, c *Client) {
 		}
 		if m != nil {
 			t.Errorf("GetMulti with cancelled context: got map=%v, want=nil", m)
+		}
+	})
+
+	t.Run("getmulti doesn't allocate after context cancellation", func(t *testing.T) {
+		mustSet(&Item{Key: "large1", Value: make([]byte, 1000)})
+
+		// Fetch more keys to increase the chance of the cancellation happening during fetching.
+		requestedKeys := slices.Repeat([]string{"large1"}, 1000)
+
+		var avgRequestDuration time.Duration
+		{
+			// Run the query a few times to choose a realistic timeout
+			startTime := time.Now()
+			for i := 0; i < 5; i++ {
+				_, _ = c.GetMulti(context.Background(), requestedKeys)
+			}
+			avgRequestDuration = time.Since(startTime) / 5
+		}
+
+		requestTimeout := avgRequestDuration * 2
+		t.Logf("Average GetMulti duration %s; choosing max timeout of %s", avgRequestDuration, requestTimeout)
+
+		for i := 0; i < 100; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rand.Int63n(int64(requestTimeout))))
+			t.Cleanup(cancel)
+			allowedAllocations := &atomic.Bool{}
+			allowedAllocations.Store(true)
+
+			allocator := &mockAllocator{get: func(sz int) *[]byte {
+				time.Sleep(10 * time.Microsecond) // Slow down allocation to make the
+				if !allowedAllocations.Load() {
+					t.Errorf("GetMulti allocated memory after context was cancelled")
+				}
+				s := make([]byte, sz)
+				return &s
+			}}
+
+			start := time.Now()
+			_, _ = c.GetMulti(ctx, requestedKeys, WithAllocator(allocator))
+			allowedAllocations.Store(false)
+			t.Logf("GetMulti took %v (cancelled: %t)", time.Since(start), ctx.Err() != nil)
 		}
 	})
 
@@ -679,6 +723,7 @@ func BenchmarkParseGetResponse(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
+		opts.doneWithAlloc.Add(1)
 		err := c.parseGetResponse(context.Background(), reader, cn, opts, func(it *Item) {
 			opts.Alloc.Put(&it.Value)
 		})
@@ -726,4 +771,17 @@ func (p *testAllocator) Get(sz int) *[]byte {
 func (p *testAllocator) Put(b *[]byte) {
 	p.numPuts += 1
 	p.pool.Put(b)
+}
+
+type mockAllocator struct {
+	get func(sz int) *[]byte
+	put func(b *[]byte)
+}
+
+func (m *mockAllocator) Get(sz int) *[]byte {
+	return m.get(sz)
+}
+
+func (m *mockAllocator) Put(b *[]byte) {
+	m.put(b)
 }

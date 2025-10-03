@@ -456,6 +456,7 @@ func (c *Client) FlushAll() error {
 func (c *Client) Get(key string, opts ...Option) (item *Item, err error) {
 	options := newOptions(opts...)
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
+		options.doneWithAlloc.Add(1)
 		return c.getFromAddr(context.Background(), addr, []string{key}, options, func(it *Item) { item = it })
 	})
 	if err == nil && item == nil {
@@ -629,6 +630,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 
 	ch := make(chan error, buffered)
 	for addr, keys := range keyMap {
+		options.doneWithAlloc.Add(1)
 		go func(addr net.Addr, keys []string) {
 			err := c.getFromAddr(ctx, addr, keys, options, addItemToMap)
 			select {
@@ -637,6 +639,8 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 			}
 		}(addr, keys)
 	}
+
+	defer options.doneWithAlloc.Wait()
 
 	var err error
 	for i := 0; i < len(keyMap); i++ {
@@ -655,6 +659,16 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
 func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *conn, opts *Options, cb func(*Item)) error {
+	signalledNoMoreAllocs := false
+	signalNoMoreAllocs := func() {
+		if signalledNoMoreAllocs {
+			return
+		}
+		opts.doneWithAlloc.Done()
+		signalledNoMoreAllocs = true
+	}
+	defer signalNoMoreAllocs()
+
 	for {
 		// extend deadline before each additional call, otherwise all cumulative calls use the same overall deadline
 		conn.extendDeadline()
@@ -676,6 +690,7 @@ func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *co
 		// Check if context is cancelled before allocating memory
 		select {
 		case <-ctx.Done():
+			signalNoMoreAllocs()
 			// Still need to read the data to keep connection in valid state
 			_, err = io.CopyN(io.Discard, r, int64(buffSize))
 			if err != nil {

@@ -1,10 +1,13 @@
 package memcache
 
+import "sync"
+
 var nopAllocator = &defaultAllocator{}
 
 func newOptions(opts ...Option) *Options {
 	o := &Options{
-		Alloc: nopAllocator,
+		Alloc:         nopAllocator,
+		doneWithAlloc: &sync.WaitGroup{},
 	}
 
 	for _, opt := range opts {
@@ -19,6 +22,8 @@ func newOptions(opts ...Option) *Options {
 // passed to a Client method to a default Options instance.
 type Options struct {
 	Alloc Allocator
+
+	doneWithAlloc *sync.WaitGroup
 }
 
 // Option is a callback used to modify the Options that a particular Client
