@@ -28,13 +28,23 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func repeat[T any](slice []T, count int) []T {
+	if count <= 0 {
+		return nil
+	}
+	result := make([]T, 0, len(slice)*count)
+	for i := 0; i < count; i++ {
+		result = append(result, slice...)
+	}
+	return result
+}
 
 const testServer = "localhost:11211"
 
@@ -207,7 +217,7 @@ func testWithClient(t *testing.T, c *Client) {
 		mustSet(&Item{Key: "large1", Value: make([]byte, 1000)})
 
 		// Fetch more keys to increase the chance of the cancellation happening during fetching.
-		requestedKeys := slices.Repeat([]string{"large1"}, 1000)
+		requestedKeys := repeat([]string{"large1"}, 1000)
 
 		var avgRequestDuration time.Duration
 		{
