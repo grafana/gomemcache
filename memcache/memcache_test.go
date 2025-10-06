@@ -733,7 +733,6 @@ func BenchmarkParseGetResponse(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
-		opts.doneWithAlloc.Add(1)
 		err := c.parseGetResponse(context.Background(), reader, cn, opts, func(it *Item) {
 			opts.Alloc.Put(&it.Value)
 		})

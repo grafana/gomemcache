@@ -66,7 +66,7 @@ var (
 
 const (
 	// DefaultTimeout is the default socket read/write timeout.
-	DefaultTimeout = 100 * time.Millisecond
+	DefaultTimeout = 1000 * time.Millisecond
 
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
@@ -234,6 +234,10 @@ func (cn *conn) release() {
 
 func (cn *conn) extendDeadline() {
 	_ = cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
+}
+
+func (cn *conn) extendDeadlineLong() {
+	_ = cn.nc.SetDeadline(time.Now().Add(5 * cn.c.netTimeout()))
 }
 
 // condRelease releases this connection if the error pointed to by err
@@ -456,7 +460,6 @@ func (c *Client) FlushAll() error {
 func (c *Client) Get(key string, opts ...Option) (item *Item, err error) {
 	options := newOptions(opts...)
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
-		options.doneWithAlloc.Add(1)
 		return c.getFromAddr(context.Background(), addr, []string{key}, options, func(it *Item) { item = it })
 	})
 	if err == nil && item == nil {
@@ -630,17 +633,13 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 
 	ch := make(chan error, buffered)
 	for addr, keys := range keyMap {
-		options.doneWithAlloc.Add(1)
 		go func(addr net.Addr, keys []string) {
 			err := c.getFromAddr(ctx, addr, keys, options, addItemToMap)
 			select {
 			case ch <- err:
-			case <-ctx.Done():
 			}
 		}(addr, keys)
 	}
-
-	defer options.doneWithAlloc.Wait()
 
 	var err error
 	for i := 0; i < len(keyMap); i++ {
@@ -649,8 +648,6 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 			if ge != nil {
 				err = ge
 			}
-		case <-ctx.Done():
-			return nil, fmt.Errorf("memcache GetMulti: %w", ctx.Err())
 		}
 	}
 	return m, err
@@ -659,60 +656,28 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
 func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *conn, opts *Options, cb func(*Item)) error {
-	signalledNoMoreAllocs := false
-	signalNoMoreAllocs := func() {
-		if signalledNoMoreAllocs {
-			return
-		}
-		opts.doneWithAlloc.Done()
-		signalledNoMoreAllocs = true
+	lineReader := allocatingLineReader{
+		allocator: opts.Alloc,
 	}
-	defer signalNoMoreAllocs()
-
 	for {
-		// extend deadline before each additional call, otherwise all cumulative calls use the same overall deadline
-		conn.extendDeadline()
-		line, err := r.ReadSlice('\n')
-
-		if err != nil {
-			return err
-		}
-		if bytes.Equal(line, resultEnd) {
-			return nil
-		}
-		it := new(Item)
-		size, err := scanGetResponseLine(line, it)
-		if err != nil {
-			return err
-		}
-		buffSize := size + 2
-
 		// Check if context is cancelled before allocating memory
 		select {
 		case <-ctx.Done():
-			signalNoMoreAllocs()
-			// Still need to read the data to keep connection in valid state
-			_, err = io.CopyN(io.Discard, r, int64(buffSize))
-			if err != nil {
-				return err
-			}
-			// Continue reading without processing to maintain connection state
-			continue
+			// Try to discard the rest of the response to keep the connection in a good state
+			// We don't want to block forever here, so use a longer deadline than usual, but don't renew it on every item read.
+			conn.extendDeadlineLong()
+			return tryDiscardLines(r)
 		default:
 		}
 
-		buff := opts.Alloc.Get(buffSize)
-		it.Value = (*buff)[:buffSize]
-		_, err = io.ReadFull(r, it.Value)
-		if err != nil {
-			opts.Alloc.Put(buff)
+		// extend deadline before each additional call, otherwise all cumulative calls use the same overall deadline
+		conn.extendDeadline()
+		it, err := readLine(r, lineReader)
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
 			return err
 		}
-		if !bytes.HasSuffix(it.Value, crlf) {
-			opts.Alloc.Put(buff)
-			return fmt.Errorf("memcache: corrupt get result read")
-		}
-		it.Value = it.Value[:size]
 		cb(it)
 	}
 }
