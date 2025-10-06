@@ -640,11 +640,9 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 
 	var err error
 	for i := 0; i < len(keyMap); i++ {
-		select {
-		case ge := <-ch:
-			if ge != nil {
-				err = ge
-			}
+		ge := <-ch
+		if ge != nil {
+			err = ge
 		}
 	}
 	return m, err
