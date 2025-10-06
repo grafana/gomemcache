@@ -55,7 +55,6 @@ func tryDiscardLines(r *bufio.Reader) error {
 			return fmt.Errorf("memcache GetMulti: discarding cancelled response: %w", err)
 		}
 	}
-	return nil
 }
 
 func readLine[R lineReader](r *bufio.Reader, buff R) (*Item, error) {

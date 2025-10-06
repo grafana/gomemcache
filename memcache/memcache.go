@@ -634,10 +634,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 	ch := make(chan error, buffered)
 	for addr, keys := range keyMap {
 		go func(addr net.Addr, keys []string) {
-			err := c.getFromAddr(ctx, addr, keys, options, addItemToMap)
-			select {
-			case ch <- err:
-			}
+			ch <- c.getFromAddr(ctx, addr, keys, options, addItemToMap)
 		}(addr, keys)
 	}
 
