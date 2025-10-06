@@ -666,7 +666,11 @@ func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *co
 			// Try to discard the rest of the response to keep the connection in a good state
 			// We don't want to block forever here, so use a longer deadline than usual, but don't renew it on every item read.
 			conn.extendDeadlineLong()
-			return tryDiscardLines(r)
+			err := tryDiscardLines(r)
+			if err != nil {
+				return fmt.Errorf("memcache GetMulti: %w %w", ctx.Err(), err)
+			}
+			return fmt.Errorf("memcache GetMulti: %w", ctx.Err())
 		default:
 		}
 
