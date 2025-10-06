@@ -665,7 +665,7 @@ func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *co
 			if err != nil {
 				return fmt.Errorf("memcache GetMulti: %w %w", ctx.Err(), err)
 			}
-			return fmt.Errorf("memcache GetMulti: %w", ctx.Err())
+			return nil
 		default:
 		}
 
