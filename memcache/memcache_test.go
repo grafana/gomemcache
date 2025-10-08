@@ -637,29 +637,10 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 }
 
 func TestClient_GetMulti_ContextCancelled(t *testing.T) {
-	clientConn, srvConn := net.Pipe()
-	t.Cleanup(func() {
-		_ = srvConn.Close()
-		_ = clientConn.Close()
-	})
-
-	c := NewFromSelector(dummySelector{})
-	c.DialTimeout = func(string, string, time.Duration) (net.Conn, error) {
-		return clientConn, nil
-	}
-
-	srvReqs := make(chan string)
-	go func() {
-		br := bufio.NewReader(srvConn)
-		for {
-			line, _ := br.ReadSlice('\n')
-			srvReqs <- string(line)
-		}
-	}()
-
 	t.Run("should respect context cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 
+		c, srvw, srvReqs := getClientWithFakeServer(t)
 		errCh := make(chan error)
 		go func() {
 			_, err := c.GetMulti(ctx, []string{"key1", "key2"})
@@ -672,7 +653,7 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 		}
 
 		// Send only a header portion of the response, causing the client to block, waiting for the rest.
-		if _, err := io.WriteString(srvConn, "VALUE key1 0 5\r\n"); err != nil {
+		if _, err := io.WriteString(srvw, "VALUE key1 0 5\r\n"); err != nil {
 			t.Fatalf("write GetMulti response header: %v", err)
 		}
 
@@ -680,7 +661,7 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 		cancel()
 
 		// Send the rest of the response to unblock the client and to trigger the connection draining.
-		if _, err := io.WriteString(srvConn, "abcde\r\nVALUE key2 0 3\r\nabc\r\nEND\r\n"); err != nil {
+		if _, err := io.WriteString(srvw, "abcde\r\nVALUE key2 0 3\r\nabc\r\nEND\r\n"); err != nil {
 			t.Fatalf("write GetMulti response: %v", err)
 		}
 
@@ -690,9 +671,10 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 		}
 	})
 
-	t.Run("should context canceled when conn draining fails", func(t *testing.T) {
+	t.Run("should respect context cancelled when connection draining fails", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 
+		c, srvw, srvReqs := getClientWithFakeServer(t)
 		errCh := make(chan error)
 		go func() {
 			_, err := c.GetMulti(ctx, []string{"key1", "key2"})
@@ -705,7 +687,7 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 		}
 
 		// Send only a header portion of the response, causing the client to block, waiting for the rest.
-		if _, err := io.WriteString(srvConn, "VALUE key1 0 5\r\n"); err != nil {
+		if _, err := io.WriteString(srvw, "VALUE key1 0 5\r\n"); err != nil {
 			t.Fatalf("write GetMulti response header: %v", err)
 		}
 
@@ -714,7 +696,7 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 
 		// This chunk of the response isn't complete, because it doesn't end with "END\r\n".
 		// Draining this request will cause the connection to timeout. This shouldn't be visible to the caller, because the context was already cancelled.
-		if _, err := io.WriteString(srvConn, "abcde\r\nVALUE key2 0 3\r\n"); err != nil {
+		if _, err := io.WriteString(srvw, "abcde\r\nVALUE key2 0 3\r\n"); err != nil {
 			t.Fatalf("write GetMulti response: %v", err)
 		}
 
@@ -723,6 +705,32 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 			t.Errorf("GetMulti with cancelled context during parsing: got err=%v, want context.Canceled", err)
 		}
 	})
+}
+
+// getClientWithFakeServer creates a new client, whose dial function is bound to an in-memory synchronous server.
+func getClientWithFakeServer(t *testing.T) (*Client, io.Writer, <-chan string) {
+	cliConn, srvConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = srvConn.Close()
+		_ = cliConn.Close()
+	})
+
+	c := NewFromSelector(dummySelector{})
+	c.DialTimeout = func(string, string, time.Duration) (net.Conn, error) {
+		return cliConn, nil
+	}
+
+	srvReqs := make(chan string)
+	go func() {
+		br := bufio.NewReader(srvConn)
+		for {
+			// ignores error for simplicity
+			line, _ := br.ReadSlice('\n')
+			srvReqs <- string(line)
+		}
+	}()
+
+	return c, srvConn, srvReqs
 }
 
 type dummyAddr struct{}
