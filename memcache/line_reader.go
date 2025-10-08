@@ -17,13 +17,15 @@ type allocatingLineReader struct {
 }
 
 func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, error) {
-	// Get can return a larger buffer than requested, but never smaller.
-	// So we need to save how much of it we actually use.
-	// Expect the line to end with \r\n, so read 2 extra bytes.
-	readSize := lineLength + 2
-	buff := s.allocator.Get(readSize)
+	// Note that lineLength MUST account for the trailing \r\n.
+	if lineLength <= len(crlf) {
+		return nil, errors.New("line length too small: must include CRLF")
+	}
 
-	destBuf := (*buff)[:readSize]
+	// Get can return a larger buffer than requested, but never smaller.
+	buff := s.allocator.Get(lineLength)
+
+	destBuf := (*buff)[:lineLength]
 	_, err := io.ReadFull(from, destBuf)
 	if err != nil {
 		s.allocator.Put(buff)
@@ -33,7 +35,7 @@ func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, 
 		s.allocator.Put(buff)
 		return nil, fmt.Errorf("line is not followed by CRLF")
 	}
-	return destBuf[:lineLength], nil
+	return destBuf[:lineLength-len(crlf)], nil
 }
 
 type noopLineReader struct{}
@@ -70,7 +72,11 @@ func readLine[R lineReader](r *bufio.Reader, buff R) (*Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	it.Value, err = buff.ReadLine(r, size)
+
+	// Expect the line to end with \r\n, so read 2 extra bytes.
+	readSize := size + 2
+
+	it.Value, err = buff.ReadLine(r, readSize)
 	if err != nil {
 		return nil, fmt.Errorf("memcache: corrupt get result: %w", err)
 	}
