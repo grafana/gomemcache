@@ -73,8 +73,8 @@ func readLine[R lineReader](r *bufio.Reader, buff R) (*Item, error) {
 		return nil, err
 	}
 
-	// Expect the line to end with \r\n, so read 2 extra bytes.
-	readSize := size + 2
+	// Expect the line to end with \r\n
+	readSize := size + len(crlf)
 
 	it.Value, err = buff.ReadLine(r, readSize)
 	if err != nil {
