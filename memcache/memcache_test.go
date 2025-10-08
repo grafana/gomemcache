@@ -657,7 +657,7 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 		}
 	}()
 
-	t.Run("should context canceled", func(t *testing.T) {
+	t.Run("should respect context cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		errCh := make(chan error)
