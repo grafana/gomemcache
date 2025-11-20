@@ -25,7 +25,10 @@ func BenchmarkReadLine(b *testing.B) {
 
 			var buf bufio.Reader
 			for i := 0; i < b.N; i++ {
-				resp.Seek(0, io.SeekStart)
+				_, err := resp.Seek(0, io.SeekStart)
+				if err != nil {
+					b.Fatal(err)
+				}
 				buf.Reset(resp)
 
 				it, err := readLine(&buf, lineReader)
