@@ -35,15 +35,7 @@ func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, 
 		s.allocator.Put(buff)
 		return nil, fmt.Errorf("line is not followed by CRLF")
 	}
-
-	destBuf = destBuf[:lineLength-len(crlf)]
-	if len(destBuf) == 0 {
-		// No point in holding the buffer if the item doesn't have value. Put buf back into the pool, and reply with a zero-length slice.
-		s.allocator.Put(buff)
-		return []byte{}, nil
-	}
-
-	return destBuf, err
+	return destBuf[:lineLength-len(crlf)], nil
 }
 
 type noopLineReader struct{}
