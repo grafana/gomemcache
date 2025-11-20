@@ -2,7 +2,6 @@ package memcache
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -32,9 +31,6 @@ func BenchmarkReadLine(b *testing.B) {
 				buf.Reset(resp)
 
 				it, err := readLine(&buf, lineReader)
-				if errors.Is(err, io.EOF) {
-					continue
-				}
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -45,8 +41,8 @@ func BenchmarkReadLine(b *testing.B) {
 					b.Fatalf("unexpected value len: want %d, got %d bytes", size, len(it.Value))
 				}
 
-				// Note, the current option's promise is the Client will only call Put in the event of an error.
-				// That is, the callers *may* expect that they are allowed to Put the Value back into the pool.
+				// Note, the current option's promise is that the Client will only call Put in the event of an error.
+				// That is, the callers *may* expect that they are allowed to Put the item's Value back into the pool.
 				alloc.Put(&it.Value)
 			}
 		})
