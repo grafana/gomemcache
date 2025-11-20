@@ -18,7 +18,7 @@ type allocatingLineReader struct {
 
 func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, error) {
 	// Note that lineLength MUST account for the trailing \r\n.
-	if lineLength <= len(crlf) {
+	if lineLength < len(crlf) {
 		return nil, errors.New("line length too small: must include CRLF")
 	}
 
@@ -35,7 +35,15 @@ func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, 
 		s.allocator.Put(buff)
 		return nil, fmt.Errorf("line is not followed by CRLF")
 	}
-	return destBuf[:lineLength-len(crlf)], nil
+
+	destBuf = destBuf[:lineLength-len(crlf)]
+	if len(destBuf) == 0 {
+		// No point in holding the buffer if the item doesn't have value. Put buf back into the pool, and reply with a zero-length slice.
+		s.allocator.Put(buff)
+		return []byte{}, nil
+	}
+
+	return destBuf, err
 }
 
 type noopLineReader struct{}
