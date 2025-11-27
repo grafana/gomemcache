@@ -147,6 +147,26 @@ func testWithClient(t *testing.T, c *Client) {
 		}
 	})
 
+	t.Run("get and set zero-length item", func(t *testing.T) {
+		foo := &Item{Key: "zerofoo"} // memcached allows values of zero length
+		err := c.Set(foo)
+		checkErr(err, "first set(zerofoo): %v", err)
+		err = c.Set(foo)
+		checkErr(err, "second set(zerofoo): %v", err)
+
+		it, err := c.Get("zerofoo")
+		checkErr(err, "get(zerofoo): %v", err)
+		if it.Key != "zerofoo" {
+			t.Errorf("get(zerofoo) Key = %q, want zerofoo", it.Key)
+		}
+		if string(it.Value) != "" {
+			t.Errorf("get(zerofoo) Value = %q, want empty", string(it.Value))
+		}
+		if it.Flags != 0 {
+			t.Errorf("get(zerofoo) Flags = %v, want 0", it.Flags)
+		}
+	})
+
 	t.Run("set malformed keys", func(t *testing.T) {
 		malFormed := &Item{Key: "foo bar", Value: []byte("foobarval")}
 		err := c.Set(malFormed)
