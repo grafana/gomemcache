@@ -88,6 +88,13 @@ const buffered = 8 // arbitrary buffered channel size, for readability
 // This is used to determine whether or not a server connection should
 // be re-used or not. If an error occurs, by default we don't reuse the
 // connection, unless it was just a protocol-level error.
+//
+// SERVER_ERROR replies are resumable: memcached sends them as complete,
+// well-formed lines and keeps the connection in sync (on storage errors it
+// even swallows the request's data block; see process_update_command in
+// memcached's proto_text.c). The known exception is "out of memory reading
+// request", which closes the connection server-side; reusing it costs one
+// failed request, the same as any stale pooled connection.
 func resumableError(err error) bool {
 	switch {
 	case errors.Is(err, ErrCacheMiss),
@@ -101,9 +108,7 @@ func resumableError(err error) bool {
 }
 
 // serverErrorFromLine returns an error wrapping ErrServerError if line is a
-// SERVER_ERROR response, or nil otherwise. A SERVER_ERROR response is a clean,
-// protocol-level error: the server sent a complete, well-formed reply and the
-// connection is left in a usable state, so it is safe to reuse.
+// SERVER_ERROR response, or nil otherwise.
 func serverErrorFromLine(line []byte) error {
 	if !bytes.HasPrefix(line, resultServerErrorPrefix) {
 		return nil
