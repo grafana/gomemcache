@@ -838,10 +838,12 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 		return ErrCASConflict
 	case bytes.Equal(line, resultNotFound):
 		return ErrCacheMiss
+	default:
+		if err := serverErrorFromLine(line); err != nil {
+			return err
+		}
 	}
-	if err := serverErrorFromLine(line); err != nil {
-		return err
-	}
+
 	return fmt.Errorf("memcache: unexpected response line from %q: %q", verb, string(line))
 }
 
