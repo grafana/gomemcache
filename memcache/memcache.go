@@ -875,9 +875,11 @@ func writeExpectf(rw *bufio.ReadWriter, expect []byte, format string, args ...in
 		return ErrCASConflict
 	case bytes.Equal(line, resultNotFound):
 		return ErrCacheMiss
-	}
-	if err := serverErrorFromLine(line); err != nil {
-		return err
+	default:
+		if err := serverErrorFromLine(line); err != nil {
+			return err
+		}
+
 	}
 	return fmt.Errorf("memcache: unexpected response line: %q", string(line))
 }
