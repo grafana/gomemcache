@@ -437,7 +437,7 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 		t.Cleanup(c.Close)
 		c.MinIdleConnsHeadroomPercentage = headroomPercentage
 		c.MaxIdleConns = 100
-		c.recentlyUsedConnsThreshold = recentlyUsedThreshold
+		c.RecentlyUsedConnsThreshold = recentlyUsedThreshold
 
 		return c
 	}
@@ -462,7 +462,7 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 
 		for _, freeConnections := range c.freeconn {
 			for _, freeConn := range freeConnections {
-				if time.Since(freeConn.idleSince) >= c.recentlyUsedConnsThreshold {
+				if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
 					idle++
 				} else {
 					recentlyUsed++
