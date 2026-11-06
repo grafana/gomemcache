@@ -486,17 +486,20 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 	}
 
 	countFreeConns := func(c *Client) (recentlyUsed, idle int) {
-		c.lk.Lock()
-		defer c.lk.Unlock()
+		for _, shard := range c.shards {
+			shard.mtx.Lock()
 
-		for _, freeConnections := range c.freeconn {
-			for _, freeConn := range freeConnections {
-				if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
-					idle++
-				} else {
-					recentlyUsed++
+			for _, freeConnections := range shard.free {
+				for _, freeConn := range freeConnections {
+					if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
+						idle++
+					} else {
+						recentlyUsed++
+					}
 				}
 			}
+
+			shard.mtx.Unlock()
 		}
 
 		return
@@ -759,9 +762,15 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 func TestServerError_KeepsConnectionOpen(t *testing.T) {
 	// countFreeConns returns the number of connections in the client's free pool.
 	countFreeConns := func(c *Client) int {
-		c.lk.Lock()
-		defer c.lk.Unlock()
-		return len(c.freeconn[dummyAddr{}.String()])
+		total := 0
+
+		for _, shard := range c.shards {
+			shard.mtx.Lock()
+			total += len(shard.free[dummyAddr{}.String()])
+			shard.mtx.Unlock()
+		}
+
+		return total
 	}
 
 	// assertReusable verifies that the connection went back to the free pool and
