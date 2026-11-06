@@ -28,6 +28,8 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,35 +37,71 @@ import (
 	"time"
 )
 
-func repeat[T any](slice []T, count int) []T {
-	if count <= 0 {
-		return nil
+func startServer(t testing.TB, host string, port int) {
+	cmd := exec.Command("memcached", "-p", strconv.Itoa(port))
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("unable to start memcached server on port %d: %s", port, err)
 	}
-	result := make([]T, 0, len(slice)*count)
-	for i := 0; i < count; i++ {
-		result = append(result, slice...)
-	}
-	return result
+
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	dialAddr := net.JoinHostPort(host, strconv.Itoa(port))
+	waitForServer(t, dialAddr, 5*time.Second)
+	prepareServer(t, dialAddr)
 }
 
-const testServer = "localhost:11211"
+func waitForServer(t testing.TB, dialAddr string, timeout time.Duration) {
+	const step = 100 * time.Millisecond
+	waited := time.Duration(0)
 
-func setup(t *testing.T) bool {
-	c, err := net.Dial("tcp", testServer)
+	for waited < timeout {
+		c, err := net.Dial("tcp", dialAddr)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+
+		time.Sleep(step)
+		waited += step
+	}
+
+	t.Fatalf("gave up waiting for memcached after %s", timeout)
+}
+
+func prepareServer(t testing.TB, dialAddr string) {
+	c, err := net.Dial("tcp", dialAddr)
 	if err != nil {
-		t.Skipf("skipping test; no server running at %s", testServer)
+		t.Fatalf("unable to connect to memcached %s to prepare: %s", dialAddr, err)
 	}
 	_, _ = c.Write([]byte("flush_all\r\n"))
-	c.Close()
-	return true
+	_ = c.Close()
 }
 
 func TestLocalhost(t *testing.T) {
-	if !setup(t) {
-		return
+	startServer(t, "localhost", 11221)
+
+	c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
+	t.Cleanup(c.Close)
+
+	testWithClient(t, c)
+}
+
+func TestShardedServers(t *testing.T) {
+	startServer(t, "localhost", 11221)
+	startServer(t, "localhost", 11231)
+
+	dialAddr1 := net.JoinHostPort("localhost", strconv.Itoa(11221))
+	dialAddr2 := net.JoinHostPort("localhost", strconv.Itoa(11231))
+
+	servers := &ServerList{}
+	if err := servers.SetServers(dialAddr1, dialAddr2); err != nil {
+		t.Fatalf("unable to set servers in selector: %s", err)
 	}
 
-	c := New(testServer)
+	c := NewShardedFromSelector(servers, 2)
 	t.Cleanup(c.Close)
 
 	testWithClient(t, c)
@@ -74,13 +112,12 @@ func TestUnixSocket(t *testing.T) {
 	sock := path.Join(t.TempDir(), fmt.Sprintf("test-gomemcache-%d.sock", os.Getpid()))
 	cmd := exec.Command("memcached", "-s", sock)
 	if err := cmd.Start(); err != nil {
-		t.Skipf("skipping test; couldn't find memcached")
-		return
+		t.Fatalf("unable to start memcached server over unix socket %s: %s", sock, err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-	}()
+	})
 
 	// Wait a bit for the socket to appear.
 	for i := 0; i < 10; i++ {
@@ -237,7 +274,7 @@ func testWithClient(t *testing.T, c *Client) {
 		mustSet(&Item{Key: "large1", Value: make([]byte, 1000)})
 
 		// Fetch more keys to increase the chance of the cancellation happening during fetching.
-		requestedKeys := repeat([]string{"large1"}, 1000)
+		requestedKeys := slices.Repeat([]string{"large1"}, 1000)
 
 		var avgRequestDuration time.Duration
 		{
@@ -461,8 +498,10 @@ func testTouchWithClient(t *testing.T, c *Client) {
 func TestClient_releaseIdleConnections(t *testing.T) {
 	const recentlyUsedThreshold = 2 * time.Second
 
+	startServer(t, "localhost", 11221)
+
 	getClientWithMinIdleConnsHeadroomPercentage := func(t *testing.T, headroomPercentage float64) *Client {
-		c := New(testServer)
+		c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
 		t.Cleanup(c.Close)
 		c.MinIdleConnsHeadroomPercentage = headroomPercentage
 		c.MaxIdleConns = 100
@@ -486,17 +525,20 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 	}
 
 	countFreeConns := func(c *Client) (recentlyUsed, idle int) {
-		c.lk.Lock()
-		defer c.lk.Unlock()
+		for _, shard := range c.shards {
+			shard.mtx.Lock()
 
-		for _, freeConnections := range c.freeconn {
-			for _, freeConn := range freeConnections {
-				if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
-					idle++
-				} else {
-					recentlyUsed++
+			for _, freeConnections := range shard.free {
+				for _, freeConn := range freeConnections {
+					if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
+						idle++
+					} else {
+						recentlyUsed++
+					}
 				}
 			}
+
+			shard.mtx.Unlock()
 		}
 
 		return
@@ -759,9 +801,15 @@ func TestClient_GetMulti_ContextCancelled(t *testing.T) {
 func TestServerError_KeepsConnectionOpen(t *testing.T) {
 	// countFreeConns returns the number of connections in the client's free pool.
 	countFreeConns := func(c *Client) int {
-		c.lk.Lock()
-		defer c.lk.Unlock()
-		return len(c.freeconn[dummyAddr{}.String()])
+		total := 0
+
+		for _, shard := range c.shards {
+			shard.mtx.Lock()
+			total += len(shard.free[dummyAddr{}.String()])
+			shard.mtx.Unlock()
+		}
+
+		return total
 	}
 
 	// assertReusable verifies that the connection went back to the free pool and
@@ -953,7 +1001,9 @@ func (d dummySelector) Each(f func(net.Addr) error) error {
 }
 
 func TestClient_Close_ShouldBeIdempotent(t *testing.T) {
-	c := New(testServer)
+	startServer(t, "localhost", 11221)
+
+	c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
 
 	// Call Close twice and make sure it doesn't panic the 2nd time.
 	c.Close()
@@ -961,8 +1011,11 @@ func TestClient_Close_ShouldBeIdempotent(t *testing.T) {
 }
 
 func BenchmarkGetMulti(b *testing.B) {
-	c := New(testServer)
-	defer c.Close()
+	startServer(b, "localhost", 11221)
+	c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
+	b.Cleanup(func() {
+		c.Close()
+	})
 
 	var keys []string
 	for i := 0; i < 100; i++ {
@@ -991,7 +1044,10 @@ func BenchmarkOnItem(b *testing.B) {
 	if err != nil {
 		b.Fatal("Could not open fake server: ", err)
 	}
-	defer fakeServer.Close()
+	b.Cleanup(func() {
+		_ = fakeServer.Close()
+	})
+
 	go func() {
 		for {
 			if c, err := fakeServer.Accept(); err == nil {
@@ -1034,12 +1090,19 @@ func BenchmarkParseGetResponse(b *testing.B) {
 	response := strings.NewReader(fmt.Sprintf("VALUE foobar1234 0 %v 1234\r\n%s\r\nEND\r\n", valueSize, strings.Repeat("a", valueSize)))
 
 	opts := newOptions(WithAllocator(newTestAllocator(valueSize + 2)))
-	c := &Client{}
 	reader := bufio.NewReader(response)
 
-	addr, err := net.ResolveTCPAddr("tcp", testServer)
+	startServer(b, "localhost", 11221)
+	serverAddr := net.JoinHostPort("localhost", strconv.Itoa(11221))
+
+	c := New(serverAddr)
+	b.Cleanup(func() {
+		c.Close()
+	})
+
+	addr, err := net.ResolveTCPAddr("tcp", serverAddr)
 	if err != nil {
-		b.Fatalf("failed to resolve address %q: %q", testServer, err)
+		b.Fatalf("failed to resolve address %q: %q", serverAddr, err)
 	}
 
 	cn, err := c.getConn(addr)
