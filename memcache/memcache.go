@@ -237,8 +237,11 @@ type Item struct {
 	// Zero means the Item has no expiration time.
 	Expiration int32
 
-	// Compare and swap ID.
-	casid uint64
+	// CasID is the compare and swap ID.
+	//
+	// It's populated by get requests and then the same value is
+	// required for a CompareAndSwap request to succeed.
+	CasID uint64
 }
 
 // conn is a connection to a server.
@@ -746,7 +749,7 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 	if !found { // final CAS ID is optional.
 		return int(size64), nil
 	}
-	it.casid, err = strconv.ParseUint(rest, 10, 64)
+	it.CasID, err = strconv.ParseUint(rest, 10, 64)
 	if err != nil {
 		return errf(line)
 	}
@@ -812,7 +815,7 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	var err error
 	if verb == "cas" {
 		_, err = fmt.Fprintf(rw, "%s %s %d %d %d %d\r\n",
-			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.casid)
+			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.CasID)
 	} else {
 		_, err = fmt.Fprintf(rw, "%s %s %d %d %d\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value))

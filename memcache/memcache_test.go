@@ -363,6 +363,35 @@ func testWithClient(t *testing.T, c *Client) {
 		testTouchWithClient(t, c)
 	})
 
+	t.Run("compare and swap", func(t *testing.T) {
+		mustSet(&Item{Key: "cas", Value: []byte("v1")})
+		it, err := c.Get("cas")
+		checkErr(err, "get(cas): %v", err)
+		if it.CasID == 0 {
+			t.Fatal("get(cas) CasID = 0, want the token returned by gets")
+		}
+
+		// A CAS built from the token stores; it may change any field but Key.
+		fresh := &Item{Key: "cas", Value: []byte("v2"), Expiration: 60, CasID: it.CasID}
+		err = c.CompareAndSwap(fresh)
+		checkErr(err, "cas with current token: %v", err)
+
+		// That store bumped the token, so the same token now conflicts.
+		if err := c.CompareAndSwap(fresh); err != ErrCASConflict {
+			t.Fatalf("cas with stale token want ErrCASConflict, got %v", err)
+		}
+		// An item re-created under the same key has a new token too.
+		checkErr(c.Delete("cas"), "delete(cas)")
+		checkErr(c.Add(&Item{Key: "cas", Value: []byte("v3")}), "add(cas)")
+		if err := c.CompareAndSwap(fresh); err != ErrCASConflict {
+			t.Fatalf("cas after re-add want ErrCASConflict, got %v", err)
+		}
+		checkErr(c.Delete("cas"), "delete(cas)")
+		if err := c.CompareAndSwap(fresh); err != ErrCacheMiss {
+			t.Fatalf("cas on a missing key want ErrCacheMiss, got %v", err)
+		}
+	})
+
 	t.Run("get with allocator", func(t *testing.T) {
 		foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
 		err := c.Set(foo)
@@ -945,7 +974,6 @@ func BenchmarkGetMulti(b *testing.B) {
 			Value:      []byte(strings.Repeat("bench payload", 10)),
 			Flags:      0,
 			Expiration: 30,
-			casid:      0,
 		})
 		if err != nil {
 			b.Fatal("Could not set item for test server: ", err)
