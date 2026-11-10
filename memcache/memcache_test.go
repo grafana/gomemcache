@@ -1074,6 +1074,34 @@ func BenchmarkOnItem(b *testing.B) {
 	}
 }
 
+func BenchmarkPickShard(b *testing.B) {
+	c := Client{}
+	c.shards = []*freeConnectionShard{
+		{
+			mtx:  sync.Mutex{},
+			free: make(map[string][]*conn),
+		},
+		{
+			mtx:  sync.Mutex{},
+			free: make(map[string][]*conn),
+		},
+	}
+
+	keys := []string{
+		"key-something-something-something-something-something-1",
+		"key-something-something-something-something-something-2",
+		"key-something-something-something-something-something-3",
+		"key-something-something-something-something-something-4",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for i := range keys {
+			_ = c.pickShard(keys[i])
+		}
+	}
+}
+
 func BenchmarkScanGetResponseLine(b *testing.B) {
 	line := []byte("VALUE foobar1234 0 4096 1234\r\n")
 	var it Item
