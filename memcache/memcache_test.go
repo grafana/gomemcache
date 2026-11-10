@@ -910,6 +910,359 @@ func TestServerError_KeepsConnectionOpen(t *testing.T) {
 	})
 }
 
+// getFuncs are the two ways to read one key, so that a test can run against both.
+var getFuncs = []struct {
+	name string
+	get  func(c *Client, key string) (*Item, error)
+}{
+	{name: "Get", get: func(c *Client, key string) (*Item, error) {
+		return c.Get(key)
+	}},
+	{name: "GetMulti", get: func(c *Client, key string) (*Item, error) {
+		m, err := c.GetMulti(context.Background(), []string{key})
+		return m[key], err
+	}},
+}
+
+func TestClient_Get_ConnectionClosedBeforeEnd(t *testing.T) {
+	const response = "VALUE foo 0 3 1\r\nbar\r\nEND\r\n"
+
+	tests := []struct {
+		name string
+		// sent is the part of the response that the server sends before it
+		// closes the connection.
+		sent string
+		// itemSent tells whether sent holds the whole item.
+		itemSent bool
+	}{
+		{name: "before any response"},
+		{name: "in the middle of the VALUE line", sent: "VALUE foo 0"},
+		{name: "after the VALUE line", sent: "VALUE foo 0 3 1\r\n"},
+		{name: "in the middle of the item", sent: "VALUE foo 0 3 1\r\nba"},
+		{name: "before the CRLF of the item", sent: "VALUE foo 0 3 1\r\nbar"},
+		{name: "after the item", sent: "VALUE foo 0 3 1\r\nbar\r\n", itemSent: true},
+		{name: "in the middle of the END line", sent: "VALUE foo 0 3 1\r\nbar\r\nEN", itemSent: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, f := range getFuncs {
+				t.Run(f.name, func(t *testing.T) {
+					srv := newScriptedServer(t,
+						scriptedReply{data: tc.sent, closeConn: true},
+						scriptedReply{data: response},
+					)
+					c := srv.client(t)
+
+					it, err := f.get(c, "foo")
+					if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Errorf("got item=%v err=%v, want io.ErrUnexpectedEOF", it, err)
+					}
+					if errors.Is(err, ErrCacheMiss) {
+						t.Errorf("got err=%v, a closed connection is not a cache miss", err)
+					}
+					// An item that arrived in full can come back together with the
+					// error, as it does for any other error that follows a complete
+					// item. An incomplete item must never come back.
+					if !tc.itemSent && it != nil {
+						t.Errorf("got item=%v out of an incomplete item", it)
+					}
+
+					// The connection is closed, so the client must not use it again:
+					// the next command has to go over a new connection.
+					it, err = f.get(c, "foo")
+					if err != nil {
+						t.Fatalf("after the closed connection: got err=%v, want nil", err)
+					}
+					if it == nil || string(it.Value) != "bar" {
+						t.Errorf("after the closed connection: got item=%v, want value bar", it)
+					}
+					if got := srv.accepted.Load(); got != 2 {
+						t.Errorf("connections accepted by the server: got %d, want 2", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestClient_Get_PooledConnectionClosed(t *testing.T) {
+	const response = "VALUE foo 0 3 1\r\nbar\r\nEND\r\n"
+
+	for _, f := range getFuncs {
+		t.Run(f.name, func(t *testing.T) {
+			srv := newScriptedServer(t,
+				// The server closes the connection after a complete response. The
+				// client cannot tell, so it puts the connection into its pool.
+				scriptedReply{data: response, closeConn: true},
+				scriptedReply{data: response},
+			)
+			c := srv.client(t)
+
+			it, err := f.get(c, "foo")
+			if err != nil {
+				t.Fatalf("got err=%v, want nil", err)
+			}
+			if it == nil || string(it.Value) != "bar" {
+				t.Errorf("got item=%v, want value bar", it)
+			}
+
+			// The next command goes over the pooled connection and gets no
+			// response. That is an error, and not a cache miss.
+			it, err = f.get(c, "foo")
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("over the closed connection: got item=%v err=%v, want io.ErrUnexpectedEOF", it, err)
+			}
+			if it != nil {
+				t.Errorf("over the closed connection: got item=%v, want nil", it)
+			}
+
+			// The client must not put the connection back into its pool: the
+			// next command has to go over a new connection.
+			it, err = f.get(c, "foo")
+			if err != nil {
+				t.Fatalf("after the closed connection: got err=%v, want nil", err)
+			}
+			if it == nil || string(it.Value) != "bar" {
+				t.Errorf("after the closed connection: got item=%v, want value bar", it)
+			}
+			if got := srv.accepted.Load(); got != 2 {
+				t.Errorf("connections accepted by the server: got %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestClient_Get_CompleteResponse(t *testing.T) {
+	srv := newScriptedServer(t,
+		scriptedReply{data: "VALUE foo 123 3 7\r\nbar\r\nEND\r\n"},
+		scriptedReply{data: "END\r\n"},
+		scriptedReply{data: "VALUE foo 123 3 7\r\nbar\r\nVALUE empty 0 0 8\r\n\r\nVALUE baz 0 6 9\r\nbazval\r\nEND\r\n"},
+		scriptedReply{data: "END\r\n"},
+	)
+	c := srv.client(t)
+
+	// A hit.
+	it, err := c.Get("foo")
+	if err != nil {
+		t.Fatalf("Get(foo): %v", err)
+	}
+	if it.Key != "foo" || string(it.Value) != "bar" || it.Flags != 123 || it.CasID != 7 {
+		t.Errorf("Get(foo): got %+v", *it)
+	}
+
+	// A miss.
+	if it, err := c.Get("missing"); err != ErrCacheMiss || it != nil {
+		t.Errorf("Get(missing): got item=%v err=%v, want ErrCacheMiss", it, err)
+	}
+
+	// Several items, one of them empty, and a key that is missing.
+	m, err := c.GetMulti(context.Background(), []string{"foo", "empty", "baz", "missing"})
+	if err != nil {
+		t.Fatalf("GetMulti: %v", err)
+	}
+	if len(m) != 3 {
+		t.Errorf("GetMulti: got %d items, want 3", len(m))
+	}
+	for key, want := range map[string]string{"foo": "bar", "empty": "", "baz": "bazval"} {
+		if it, ok := m[key]; !ok || string(it.Value) != want {
+			t.Errorf("GetMulti: %s: got item=%v, want value %q", key, it, want)
+		}
+	}
+
+	// Only misses.
+	m, err = c.GetMulti(context.Background(), []string{"missing"})
+	if err != nil || m == nil || len(m) != 0 {
+		t.Errorf("GetMulti(missing): got map=%v err=%v, want an empty map and no error", m, err)
+	}
+
+	// Every response ended with the END line, so the connection stayed in
+	// the pool and served all the commands.
+	if got := srv.accepted.Load(); got != 1 {
+		t.Errorf("connections accepted by the server: got %d, want 1", got)
+	}
+}
+
+func TestClient_GetMulti_ContextCancelled_ConnectionClosed(t *testing.T) {
+	const item = "VALUE key1 0 5 1\r\nabcde\r\n"
+
+	tests := []struct {
+		name string
+		// rest is what the server sends after the first item, before it
+		// closes the connection.
+		rest string
+	}{
+		{name: "after an item"},
+		{name: "in the middle of a VALUE line", rest: "VALUE key2 0"},
+		{name: "after a VALUE line", rest: "VALUE key2 0 3 2\r\n"},
+		{name: "in the middle of an item", rest: "VALUE key2 0 3 2\r\nab"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			srv := newScriptedServer(t,
+				// The context is cancelled before the server answers. The client
+				// notices it at the latest once it has read the first item, and
+				// from there on it discards the response.
+				scriptedReply{before: cancel, data: item + tc.rest, closeConn: true},
+				scriptedReply{data: item + "END\r\n"},
+			)
+			c := srv.client(t)
+
+			m, err := c.GetMulti(ctx, []string{"key1", "key2"})
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("GetMulti: got err=%v, want context.Canceled", err)
+			}
+			if m != nil {
+				t.Errorf("GetMulti: got map=%v, want nil", m)
+			}
+
+			// The connection was closed before the END line. The client must not
+			// keep it: the next command has to go over a new connection.
+			it, err := c.Get("key1")
+			if err != nil {
+				t.Fatalf("Get after the closed connection: got err=%v, want nil", err)
+			}
+			if string(it.Value) != "abcde" {
+				t.Errorf("Get after the closed connection: got value %q, want abcde", it.Value)
+			}
+			if got := srv.accepted.Load(); got != 2 {
+				t.Errorf("connections accepted by the server: got %d, want 2", got)
+			}
+		})
+	}
+}
+
+// scriptedReply is what a scriptedServer does in answer to one command line.
+type scriptedReply struct {
+	// before, if set, is called once the command is read and before data is
+	// written.
+	before func()
+	// data is written to the connection as is.
+	data string
+	// closeConn makes the server close the connection once data is written,
+	// so that the client reads the end of the stream after data.
+	closeConn bool
+}
+
+// scriptedServer is a TCP server that speaks just enough of the memcached text
+// protocol to answer single-line commands, such as gets. It answers each
+// command line that it reads, on any connection, with the next scripted reply.
+// It closes a connection when a reply says so, and when the script is over.
+type scriptedServer struct {
+	ln net.Listener
+
+	// accepted is the number of connections that the server accepted. It tells
+	// whether the client dialed a new connection or took one from its pool.
+	accepted atomic.Int32
+
+	mu      sync.Mutex
+	replies []scriptedReply
+}
+
+func newScriptedServer(t *testing.T, replies ...scriptedReply) *scriptedServer {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	s := &scriptedServer{ln: ln, replies: replies}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		// The client never closes its pooled connections, so close them here
+		// once the listener is closed, to stop the goroutines that serve them.
+		var conns []net.Conn
+		defer func() {
+			for _, conn := range conns {
+				_ = conn.Close()
+			}
+		}()
+
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conns = append(conns, conn)
+			s.accepted.Add(1)
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.serve(conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+	})
+
+	return s
+}
+
+func (s *scriptedServer) serve(conn net.Conn) {
+	defer conn.Close()
+
+	br := bufio.NewReader(conn)
+	for {
+		if _, err := br.ReadSlice('\n'); err != nil {
+			return
+		}
+		reply, ok := s.nextReply()
+		if !ok {
+			return
+		}
+		if reply.before != nil {
+			reply.before()
+		}
+		if _, err := io.WriteString(conn, reply.data); err != nil {
+			return
+		}
+		if reply.closeConn {
+			// Close the sending side only, and read until the client closes the
+			// connection. After a full close, a command that the client still
+			// sends is answered with a connection reset, and it depends on
+			// timing whether the client reads the end of the stream or the reset.
+			_ = conn.(*net.TCPConn).CloseWrite()
+			_, _ = io.Copy(io.Discard, br)
+			return
+		}
+	}
+}
+
+func (s *scriptedServer) nextReply() (scriptedReply, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.replies) == 0 {
+		return scriptedReply{}, false
+	}
+	reply := s.replies[0]
+	s.replies = s.replies[1:]
+	return reply, true
+}
+
+// client returns a Client that sends every command to the server.
+func (s *scriptedServer) client(t *testing.T) *Client {
+	c := New(s.ln.Addr().String())
+	t.Cleanup(c.Close)
+
+	// No test waits for a timeout, so leave plenty of time to a slow machine.
+	c.Timeout = 10 * time.Second
+	c.ConnectTimeout = 10 * time.Second
+
+	return c
+}
+
 // getClientWithFakeServer creates a new client, whose dial function is bound to an in-memory synchronous server.
 func getClientWithFakeServer(t *testing.T) (*Client, io.Writer, <-chan string) {
 	cliConn, srvConn := net.Pipe()

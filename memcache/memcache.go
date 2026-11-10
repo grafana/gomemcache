@@ -486,6 +486,8 @@ func (c *Client) FlushAll() error {
 
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
+// An error matching io.ErrUnexpectedEOF means that the connection was
+// closed before the end of the response.
 func (c *Client) Get(key string, opts ...Option) (item *Item, err error) {
 	options := newOptions(opts...)
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
@@ -633,6 +635,8 @@ func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) e
 // items may have fewer elements than the input slice, due to memcache
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
+// An error matching io.ErrUnexpectedEOF means that a connection was
+// closed before the end of the response.
 func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (map[string]*Item, error) {
 	// Check if context is already cancelled before doing any work
 	select {
@@ -707,7 +711,7 @@ func (c *Client) parseGetResponse(ctx context.Context, r *bufio.Reader, conn *co
 		// extend deadline before each additional call, otherwise all cumulative calls use the same overall deadline
 		conn.extendDeadline()
 		it, err := readLine(r, lineReader)
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, errEndOfResponse) {
 			return nil
 		} else if err != nil {
 			return err

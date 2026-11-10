@@ -2,11 +2,50 @@ package memcache
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 )
+
+func TestTryDiscardLines(t *testing.T) {
+	const item = "VALUE foo 0 3 1\r\nbar\r\n"
+
+	tests := []struct {
+		name     string
+		response string
+		wantErr  error
+	}{
+		{name: "no items", response: "END\r\n"},
+		{name: "one item", response: item + "END\r\n"},
+		{name: "several items", response: item + item + "END\r\n"},
+
+		// A response that stops before the END line is what the client reads
+		// when the server closes the connection.
+		{name: "closed before any line", response: "", wantErr: io.ErrUnexpectedEOF},
+		{name: "closed in the middle of a VALUE line", response: "VALUE foo 0", wantErr: io.ErrUnexpectedEOF},
+		{name: "closed after a VALUE line", response: "VALUE foo 0 3 1\r\n", wantErr: io.ErrUnexpectedEOF},
+		{name: "closed in the middle of an item", response: "VALUE foo 0 3 1\r\nba", wantErr: io.ErrUnexpectedEOF},
+		{name: "closed after an item", response: item, wantErr: io.ErrUnexpectedEOF},
+		{name: "closed in the middle of the END line", response: item + "EN", wantErr: io.ErrUnexpectedEOF},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tryDiscardLines(bufio.NewReader(strings.NewReader(tc.response)))
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("tryDiscardLines: got err=%v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("tryDiscardLines: got err=%v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
 
 func BenchmarkReadLine(b *testing.B) {
 	alloc := newTestAllocator(1024 + 2) // extra 2 is for body's trailing "\r\n"
