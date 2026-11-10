@@ -23,7 +23,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math"
 	"math/bits"
@@ -32,6 +31,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // Similar to:
@@ -318,11 +320,14 @@ func (c *Client) pickShard(id string) *freeConnectionShard {
 		return c.shards[0]
 	}
 
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(id))
-	sum := h.Sum64()
+	// Get the bytes of this string to hash without allocating.
+	sum := xxhash.Sum64(unsafe.Slice(unsafe.StringData(id), len(id)))
 
-	return c.shards[sum%uint64(len(c.shards))]
+	// We know the number of shards is a power of two so this
+	// is equivalent to a `%` operation on the length of shards.
+	idx := sum & uint64(len(c.shards)-1)
+
+	return c.shards[idx]
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
