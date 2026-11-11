@@ -31,7 +31,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -320,9 +319,7 @@ func (c *Client) pickShard(id string) *freeConnectionShard {
 		return c.shards[0]
 	}
 
-	// Get the bytes of this string to hash without allocating.
-	sum := xxhash.Sum64(unsafe.Slice(unsafe.StringData(id), len(id)))
-
+	sum := xxhash.Sum64String(id)
 	// We know the number of shards is a power of two so this
 	// is equivalent to a `%` operation on the length of shards.
 	idx := sum & uint64(len(c.shards)-1)
