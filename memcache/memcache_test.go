@@ -1102,6 +1102,32 @@ func BenchmarkPickShard(b *testing.B) {
 	}
 }
 
+// Benchmark the effect of adding padding to freeConnectionShard to make sure
+// each shard is on a different cache line (usually 64 bytes) which avoids false
+// sharing.
+func BenchmarkFreeConnectionShardLayout(b *testing.B) {
+	const numShards = 16
+
+	shards := make([]*freeConnectionShard, numShards)
+	for i := range numShards {
+		shards[i] = &freeConnectionShard{
+			mtx:  sync.Mutex{},
+			free: make(map[string][]*conn),
+		}
+	}
+
+	var idx atomic.Int32
+	b.RunParallel(func(pb *testing.PB) {
+		shard := shards[int(idx.Add(1))%len(shards)]
+		for pb.Next() {
+			// Without padding, locking the mutex of one shard would invalidate
+			// the cached value of an adjacent shard.
+			shard.mtx.Lock()
+			shard.mtx.Unlock() //nolint:staticcheck
+		}
+	})
+}
+
 func BenchmarkScanGetResponseLine(b *testing.B) {
 	line := []byte("VALUE foobar1234 0 4096 1234\r\n")
 	var it Item
