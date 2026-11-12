@@ -8,6 +8,22 @@ import (
 	"io"
 )
 
+// errEndOfResponse is returned by readLine for the END line, which terminates
+// a get response. It is deliberately not io.EOF: io.EOF is what the reader
+// returns when the server closes the connection, and that is not the end of a
+// response.
+var errEndOfResponse = errors.New("memcache: end of get response")
+
+// unexpectedEOF converts io.EOF into io.ErrUnexpectedEOF. A get response
+// always ends with an END line, so a connection that is closed anywhere before
+// it leaves the response incomplete.
+func unexpectedEOF(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
 type lineReader interface {
 	ReadLine(from io.Reader, lineLength int) ([]byte, error)
 }
@@ -29,7 +45,7 @@ func (s allocatingLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, 
 	_, err := io.ReadFull(from, destBuf)
 	if err != nil {
 		s.allocator.Put(buff)
-		return nil, fmt.Errorf("failed to read line: %w", err)
+		return nil, fmt.Errorf("failed to read line: %w", unexpectedEOF(err))
 	}
 	if !bytes.HasSuffix(destBuf, crlf) {
 		s.allocator.Put(buff)
@@ -43,7 +59,7 @@ type noopLineReader struct{}
 func (s noopLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, error) {
 	_, err := io.CopyN(io.Discard, from, int64(lineLength))
 	if err != nil {
-		return nil, fmt.Errorf("discarding line: %w", err)
+		return nil, fmt.Errorf("discarding line: %w", unexpectedEOF(err))
 	}
 	return nil, nil
 }
@@ -51,7 +67,7 @@ func (s noopLineReader) ReadLine(from io.Reader, lineLength int) ([]byte, error)
 func tryDiscardLines(r *bufio.Reader) error {
 	for {
 		_, err := readLine(r, noopLineReader{})
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, errEndOfResponse) {
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("memcache GetMulti: discarding cancelled response: %w", err)
@@ -59,13 +75,16 @@ func tryDiscardLines(r *bufio.Reader) error {
 	}
 }
 
+// readLine reads the next item of a get response from r. It returns
+// errEndOfResponse once it reads the END line, and an error matching
+// io.ErrUnexpectedEOF if the connection is closed before that.
 func readLine[R lineReader](r *bufio.Reader, buff R) (*Item, error) {
 	line, err := r.ReadSlice('\n')
 	if err != nil {
-		return nil, err
+		return nil, unexpectedEOF(err)
 	}
 	if bytes.Equal(line, resultEnd) {
-		return nil, io.EOF
+		return nil, errEndOfResponse
 	}
 	it := new(Item)
 	size, err := scanGetResponseLine(line, it)
