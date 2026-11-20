@@ -1128,6 +1128,59 @@ func BenchmarkFreeConnectionShardLayout(b *testing.B) {
 	})
 }
 
+const numItems = 8
+
+func getItems(count int) []*Item {
+	var out []*Item
+
+	for i := range count {
+		out = append(out, &Item{
+			Key:        fmt.Sprintf("something-%d", i),
+			Value:      []byte("Fuga dolores est optio eius ratione dolores. Illum quas nihil recusandae inventore iusto soluta at. Et qui numquam illum explicabo officia"),
+			Expiration: 30,
+		})
+	}
+
+	return out
+}
+func BenchmarkSet(b *testing.B) {
+	startServer(b, "localhost", 11221)
+	c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
+	b.Cleanup(func() {
+		c.Close()
+	})
+
+	_ = c.Ping()
+	items := getItems(numItems)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, item := range items {
+			if err := c.Set(item); err != nil {
+				b.Fatalf("unexpected error: %s", err)
+			}
+		}
+	}
+}
+
+func BenchmarkSetMulti(b *testing.B) {
+	startServer(b, "localhost", 11221)
+	c := New(net.JoinHostPort("localhost", strconv.Itoa(11221)))
+	b.Cleanup(func() {
+		c.Close()
+	})
+
+	_ = c.Ping()
+	items := getItems(numItems)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := c.SetMulti(items); err != nil {
+			b.Fatalf("unexpected error: %s", err)
+		}
+	}
+}
+
 func BenchmarkScanGetResponseLine(b *testing.B) {
 	line := []byte("VALUE foobar1234 0 4096 1234\r\n")
 	var it Item

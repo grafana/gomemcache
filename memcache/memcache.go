@@ -144,6 +144,7 @@ func nextPowerTwo(n int) int {
 var (
 	crlf            = []byte("\r\n")
 	resultOK        = []byte("OK\r\n")
+	resultMetaNop   = []byte("MN\r\n")
 	resultStored    = []byte("STORED\r\n")
 	resultNotStored = []byte("NOT_STORED\r\n")
 	resultExists    = []byte("EXISTS\r\n")
@@ -826,6 +827,104 @@ func cut(s string, sep byte) (before, after string, found bool) {
 		return s[:i], s[i+1:], true
 	}
 	return s, "", false
+}
+
+func (c *Client) SetMulti(items []*Item) error {
+	// Don't bother batching things if we're only trying to store a single value. Less
+	// work to just store a single item instead of spawning a goroutine, allocating
+	// a channel, and doing the set + no-op trick.
+	if len(items) == 1 {
+		return c.Set(items[0])
+	}
+
+	itemMap := make(map[net.Addr][]*Item)
+	for _, item := range items {
+		if !legalKey(item.Key) {
+			return ErrMalformedKey
+		}
+		addr, err := c.selector.PickServer(item.Key)
+		if err != nil {
+			return err
+		}
+		itemMap[addr] = append(itemMap[addr], item)
+	}
+
+	ch := make(chan error, buffered)
+	for serverAddr, serverItems := range itemMap {
+		go func(addr net.Addr, items []*Item) {
+			ch <- c.setAddr(addr, items)
+		}(serverAddr, serverItems)
+	}
+
+	var err error
+	for i := 0; i < len(itemMap); i++ {
+		ge := <-ch
+		if ge != nil {
+			err = ge
+		}
+	}
+
+	return err
+}
+
+func (c *Client) setAddr(addr net.Addr, items []*Item) error {
+	cn, err := c.getConn(addr)
+	if err != nil {
+		return err
+	}
+
+	defer cn.condRelease(&err)
+
+	for _, item := range items {
+		_, err = fmt.Fprintf(cn.rw, "ms %s %d q T%d F%d\r\n", item.Key, len(item.Value), item.Expiration, item.Flags)
+		if err != nil {
+			return err
+		}
+		if _, err = cn.rw.Write(item.Value); err != nil {
+			return err
+		}
+		if _, err = cn.rw.Write(crlf); err != nil {
+			return err
+		}
+	}
+
+	// We're using the quiet flag, `q`, above so we don't have a good way to know
+	// if we should expect any response on the connection (there's no response on
+	// success but errors are returned). Send a "no-op" command at the end so that
+	// when we get a response to the no-op command, we know we've already parsed
+	// any possible output from the store command.
+	if _, err = cn.rw.Write([]byte("mn\r\n")); err != nil {
+		return err
+	}
+
+	if err = cn.rw.Flush(); err != nil {
+		return err
+	}
+
+	var (
+		line     []byte
+		messages []string
+	)
+
+	for {
+		line, err = cn.rw.ReadSlice('\n')
+		if err != nil {
+			return err
+		}
+
+		if bytes.Equal(line, resultMetaNop) {
+			break
+		}
+
+		// TODO: Need to actually handle the possible responses from a meta set.
+		messages = append(messages, string(line))
+	}
+
+	if len(messages) > 0 {
+		return fmt.Errorf("memcache: unexpected response line: %s", strings.Join(messages, "; "))
+	}
+
+	return nil
 }
 
 // Set writes the given item, unconditionally.
