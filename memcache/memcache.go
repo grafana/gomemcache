@@ -170,16 +170,23 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return NewShardedFromSelector(ss, 1)
+	return NewStripedFromSelector(ss, 1)
 }
 
-// NewShardedFromSelector returns a new Client using the provided ServerSelector
-// with free connection lists striped over numShards different shards.
-func NewShardedFromSelector(ss ServerSelector, numShards int) *Client {
-	numShards = nextPowerTwo(numShards)
-	shards := make([]*freeConnectionShard, numShards)
-	for i := range numShards {
-		shards[i] = &freeConnectionShard{
+// NewShardedFromSelector is the former name of NewStripedFromSelector.
+//
+// Deprecated: Use NewStripedFromSelector.
+func NewShardedFromSelector(ss ServerSelector, numStripes int) *Client {
+	return NewStripedFromSelector(ss, numStripes)
+}
+
+// NewStripedFromSelector returns a new Client using the provided ServerSelector
+// with the free connection lists split into numStripes stripes.
+func NewStripedFromSelector(ss ServerSelector, numStripes int) *Client {
+	numStripes = nextPowerTwo(numStripes)
+	stripes := make([]*freeConnectionStripe, numStripes)
+	for i := range numStripes {
+		stripes[i] = &freeConnectionStripe{
 			mtx:  sync.Mutex{},
 			free: make(map[string][]*conn),
 		}
@@ -188,7 +195,7 @@ func NewShardedFromSelector(ss ServerSelector, numShards int) *Client {
 	c := &Client{
 		selector: ss,
 		closed:   make(chan struct{}),
-		shards:   shards,
+		stripes:  stripes,
 	}
 
 	go c.releaseIdleConnectionsUntilClosed()
@@ -243,7 +250,7 @@ type Client struct {
 	closeOnce sync.Once
 
 	selector ServerSelector
-	shards   []*freeConnectionShard
+	stripes  []*freeConnectionStripe
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -276,16 +283,16 @@ const (
 	freeSize      = unsafe.Sizeof(map[string][]*conn(nil)) //nolint:unused
 )
 
-// freeConnectionShard is a subset of free connections to a server. Shards
-// are picked using a cheap hash of the server address string. Shards exist
+// freeConnectionStripe is a subset of free connections to a server. Stripes
+// are picked using a cheap hash of the server address string. Stripes exist
 // to reduce contention when locks are taken.
-type freeConnectionShard struct {
+type freeConnectionStripe struct {
 	mtx  sync.Mutex
 	free map[string][]*conn
 
 	// Pad the size of this struct so that each instance of it ends up on a separate
-	// cache line. This ensures the locking/unlocking of the mutex for a single shard
-	// does not invalidate the cache line another shard is on.
+	// cache line. This ensures the locking/unlocking of the mutex for a single stripe
+	// does not invalidate the cache line another stripe is on.
 	_padding [cacheLineSize - mtxSize - freeSize]byte //nolint:unused
 }
 
@@ -326,23 +333,23 @@ func (cn *conn) condRelease(err *error) {
 	}
 }
 
-func (c *Client) pickShard(id string) *freeConnectionShard {
-	if len(c.shards) == 1 {
-		return c.shards[0]
+func (c *Client) pickStripe(id string) *freeConnectionStripe {
+	if len(c.stripes) == 1 {
+		return c.stripes[0]
 	}
 
 	sum := xxhash.Sum64String(id)
-	// We know the number of shards is a power of two so this
-	// is equivalent to a `%` operation on the length of shards.
-	idx := sum & uint64(len(c.shards)-1)
+	// We know the number of stripes is a power of two so this
+	// is equivalent to a `%` operation on the length of stripes.
+	idx := sum & uint64(len(c.stripes)-1)
 
-	return c.shards[idx]
+	return c.stripes[idx]
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	addrStr := addr.String()
 
-	s := c.pickShard(addrStr)
+	s := c.pickStripe(addrStr)
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -359,7 +366,7 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
 	addrStr := addr.String()
 
-	s := c.pickShard(addrStr)
+	s := c.pickStripe(addrStr)
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -431,10 +438,10 @@ func (c *Client) releaseIdleConnections() {
 		recentlyUsedThreshold = defaultRecentlyUsedConnsThreshold
 	}
 
-	for _, shard := range c.shards {
-		shard.mtx.Lock()
+	for _, stripe := range c.stripes {
+		stripe.mtx.Lock()
 
-		for addr, freeConnections := range shard.free {
+		for addr, freeConnections := range stripe.free {
 			numIdle := 0
 
 			// Count the number of idle connections. Since the least used connections are at the beginning
@@ -460,10 +467,10 @@ func (c *Client) releaseIdleConnections() {
 			for i := 0; i < numIdleToClose; i++ {
 				toClose = append(toClose, freeConnections[i].nc)
 			}
-			shard.free[addr] = shard.free[addr][numIdleToClose:]
+			stripe.free[addr] = stripe.free[addr][numIdleToClose:]
 		}
 
-		shard.mtx.Unlock()
+		stripe.mtx.Unlock()
 	}
 
 	for _, freeConn := range toClose {
@@ -529,6 +536,9 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 }
 
 func (c *Client) onItem(item *Item, shardKey string, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
+	if !legalShardKey(shardKey) {
+		return ErrMalformedKey
+	}
 	addr, err := c.selector.PickServer(selectorKey(item.Key, shardKey))
 	if err != nil {
 		return err
@@ -572,10 +582,10 @@ func (c *Client) Touch(key string, seconds int32, opts ...Option) (err error) {
 	})
 }
 
-// withKeyAddr validates key, but not shardKey, and calls fn with the address of
+// withKeyAddr validates itemKey and shardKey, and calls fn with the address of
 // the server that handles the call.
 func (c *Client) withKeyAddr(itemKey, shardKey string, fn func(net.Addr) error) (err error) {
-	if !legalKey(itemKey) {
+	if !legalKey(itemKey) || !legalShardKey(shardKey) {
 		return ErrMalformedKey
 	}
 	addr, err := c.selector.PickServer(selectorKey(itemKey, shardKey))
@@ -749,12 +759,16 @@ func (c *Client) GetMulti(ctx context.Context, keys []string, opts ...Option) (m
 }
 
 // keysByServer groups keys by the server that serves them. It returns
-// ErrMalformedKey for an illegal key, or the error of the selector. For no keys
-// it returns no group and picks no server.
+// ErrMalformedKey for an illegal item key or shard key, or the error of the
+// selector. For no keys it returns no group and picks no server.
 //
 // When shardKey is not empty, all keys form one group for the server of the
 // shard key. The group is the keys slice itself, not a copy.
 func (c *Client) keysByServer(itemKeys []string, shardKey string) (map[net.Addr][]string, error) {
+	if !legalShardKey(shardKey) {
+		return nil, ErrMalformedKey
+	}
+
 	keyMap := make(map[net.Addr][]string)
 
 	if shardKey != "" {

@@ -23,6 +23,12 @@ func shardKeyOf(opts []Option) string {
 	return newOptions(opts...).ShardKey
 }
 
+// legalShardKey reports whether shardKey is empty, which means no shard key, or
+// follows the rule of an item key.
+func legalShardKey(shardKey string) bool {
+	return shardKey == "" || legalKey(shardKey)
+}
+
 func selectorKey(itemKey, shardKey string) string {
 	if shardKey != "" {
 		return shardKey
@@ -64,9 +70,11 @@ func WithAllocator(alloc Allocator) Option {
 // number of item keys.
 //
 // The client passes the shard key to the ServerSelector. It does not send the
-// shard key to the server. The client does not validate the shard key, so any
-// string works. A selector can ignore a part of a long shard key: ServerList
-// uses only the first 256 bytes.
+// shard key to the server.
+//
+// A shard key follows the rule of an item key: at most 250 bytes, with no space
+// and no control character. A call with another shard key returns
+// ErrMalformedKey.
 //
 // The item key alone identifies an item on a server. Items with the same item
 // key and different shard keys collide when the shard keys pick the same

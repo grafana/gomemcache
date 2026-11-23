@@ -54,8 +54,7 @@ func ResolveServers(servers []string) ([]net.Addr, error) {
 type ServerSelector interface {
 	// PickServer returns the server address that a given item
 	// should be shared onto. The client passes the shard key of the call
-	// when it has one, and the item key otherwise. The client does not
-	// validate a shard key, so it can be any string.
+	// when it has one, and the item key otherwise.
 	PickServer(key string) (net.Addr, error)
 	Each(func(net.Addr) error) error
 }
@@ -124,8 +123,6 @@ var keyBufPool = sync.Pool{
 	},
 }
 
-// PickServer returns the server for key. It hashes only the first 256 bytes of
-// key, so two keys with the same first 256 bytes pick the same server.
 func (ss *ServerList) PickServer(key string) (net.Addr, error) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()

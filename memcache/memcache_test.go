@@ -89,7 +89,7 @@ func TestLocalhost(t *testing.T) {
 	testWithClient(t, c)
 }
 
-func TestShardedServers(t *testing.T) {
+func TestStripedServers(t *testing.T) {
 	startServer(t, "localhost", 11221)
 	startServer(t, "localhost", 11231)
 
@@ -101,7 +101,7 @@ func TestShardedServers(t *testing.T) {
 		t.Fatalf("unable to set servers in selector: %s", err)
 	}
 
-	c := NewShardedFromSelector(servers, 2)
+	c := NewStripedFromSelector(servers, 2)
 	t.Cleanup(c.Close)
 
 	testWithClient(t, c)
@@ -525,10 +525,10 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 	}
 
 	countFreeConns := func(c *Client) (recentlyUsed, idle int) {
-		for _, shard := range c.shards {
-			shard.mtx.Lock()
+		for _, stripe := range c.stripes {
+			stripe.mtx.Lock()
 
-			for _, freeConnections := range shard.free {
+			for _, freeConnections := range stripe.free {
 				for _, freeConn := range freeConnections {
 					if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
 						idle++
@@ -538,7 +538,7 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 				}
 			}
 
-			shard.mtx.Unlock()
+			stripe.mtx.Unlock()
 		}
 
 		return
@@ -803,10 +803,10 @@ func TestServerError_KeepsConnectionOpen(t *testing.T) {
 	countFreeConns := func(c *Client) int {
 		total := 0
 
-		for _, shard := range c.shards {
-			shard.mtx.Lock()
-			total += len(shard.free[dummyAddr{}.String()])
-			shard.mtx.Unlock()
+		for _, stripe := range c.stripes {
+			stripe.mtx.Lock()
+			total += len(stripe.free[dummyAddr{}.String()])
+			stripe.mtx.Unlock()
 		}
 
 		return total
@@ -1074,9 +1074,9 @@ func BenchmarkOnItem(b *testing.B) {
 	}
 }
 
-func BenchmarkPickShard(b *testing.B) {
+func BenchmarkPickStripe(b *testing.B) {
 	c := Client{}
-	c.shards = []*freeConnectionShard{
+	c.stripes = []*freeConnectionStripe{
 		{
 			mtx:  sync.Mutex{},
 			free: make(map[string][]*conn),
@@ -1097,20 +1097,20 @@ func BenchmarkPickShard(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for i := range keys {
-			_ = c.pickShard(keys[i])
+			_ = c.pickStripe(keys[i])
 		}
 	}
 }
 
-// Benchmark the effect of adding padding to freeConnectionShard to make sure
-// each shard is on a different cache line (usually 64 bytes) which avoids false
+// Benchmark the effect of adding padding to freeConnectionStripe to make sure
+// each stripe is on a different cache line (usually 64 bytes) which avoids false
 // sharing.
-func BenchmarkFreeConnectionShardLayout(b *testing.B) {
-	const numShards = 16
+func BenchmarkFreeConnectionStripeLayout(b *testing.B) {
+	const numStripes = 16
 
-	shards := make([]*freeConnectionShard, numShards)
-	for i := range numShards {
-		shards[i] = &freeConnectionShard{
+	stripes := make([]*freeConnectionStripe, numStripes)
+	for i := range numStripes {
+		stripes[i] = &freeConnectionStripe{
 			mtx:  sync.Mutex{},
 			free: make(map[string][]*conn),
 		}
@@ -1118,12 +1118,12 @@ func BenchmarkFreeConnectionShardLayout(b *testing.B) {
 
 	var idx atomic.Int32
 	b.RunParallel(func(pb *testing.PB) {
-		shard := shards[int(idx.Add(1))%len(shards)]
+		stripe := stripes[int(idx.Add(1))%len(stripes)]
 		for pb.Next() {
-			// Without padding, locking the mutex of one shard would invalidate
-			// the cached value of an adjacent shard.
-			shard.mtx.Lock()
-			shard.mtx.Unlock() //nolint:staticcheck
+			// Without padding, locking the mutex of one stripe would invalidate
+			// the cached value of an adjacent stripe.
+			stripe.mtx.Lock()
+			stripe.mtx.Unlock() //nolint:staticcheck
 		}
 	})
 }
@@ -1456,7 +1456,7 @@ func TestWithShardKey(t *testing.T) {
 		fakeClient.Timeout = time.Second
 		resCh := make(chan result, 1)
 		go func() {
-			items, err := fakeClient.GetMulti(ctx, []string{"key1", "key2"}, WithShardKey("object g"))
+			items, err := fakeClient.GetMulti(ctx, []string{"key1", "key2"}, WithShardKey("object-g"))
 			resCh <- result{items, err}
 		}()
 
@@ -1569,10 +1569,9 @@ func TestWithShardKey(t *testing.T) {
 		}
 	})
 
-	t.Run("Set, Get and GetMulti accept a shard key that is not a legal item key", func(t *testing.T) {
-		key := "illegal-shard-key-item"
-		shardKey := "not legal\r\n" + strings.Repeat("x", 300)
-		withShardKey := WithShardKey(shardKey)
+	t.Run("Set, Get and GetMulti accept a shard key of 250 bytes", func(t *testing.T) {
+		key := "longest-shard-key-item"
+		withShardKey := WithShardKey(strings.Repeat("x", 250))
 
 		if err := c.Set(&Item{Key: key, Value: []byte("v")}, withShardKey); err != nil {
 			t.Fatalf("Set: %v", err)
@@ -1586,6 +1585,65 @@ func TestWithShardKey(t *testing.T) {
 		}
 		if len(got) != 1 {
 			t.Fatalf("GetMulti found %d of 1 items", len(got))
+		}
+	})
+
+	t.Run("every method returns ErrMalformedKey and picks no server for an illegal shard key", func(t *testing.T) {
+		illegalShardKeys := map[string]string{
+			"a space":             "not legal",
+			"a control character": "not\x01legal",
+			"a line break":        "not\r\nlegal",
+			"251 bytes":           strings.Repeat("x", 251),
+		}
+
+		for name, shardKey := range illegalShardKeys {
+			t.Run("shard key with "+name, func(t *testing.T) {
+				recorder := &recordingSelector{ServerSelector: servers}
+				rc := NewFromSelector(recorder)
+				t.Cleanup(rc.Close)
+
+				withShardKey := WithShardKey(shardKey)
+				newItem := func() *Item { return &Item{Key: "legal-item-key", Value: []byte("v")} }
+				calls := map[string]func() error{
+					"Get": func() error {
+						_, err := rc.Get("legal-item-key", withShardKey)
+						return err
+					},
+					"GetMulti": func() error {
+						_, err := rc.GetMulti(ctx, []string{"legal-item-key"}, withShardKey)
+						return err
+					},
+					"GetMulti with no item keys": func() error {
+						_, err := rc.GetMulti(ctx, nil, withShardKey)
+						return err
+					},
+					"Set":            func() error { return rc.Set(newItem(), withShardKey) },
+					"Add":            func() error { return rc.Add(newItem(), withShardKey) },
+					"Replace":        func() error { return rc.Replace(newItem(), withShardKey) },
+					"CompareAndSwap": func() error { return rc.CompareAndSwap(newItem(), withShardKey) },
+					"Touch":          func() error { return rc.Touch("legal-item-key", 100, withShardKey) },
+					"Delete":         func() error { return rc.Delete("legal-item-key", withShardKey) },
+					"Increment": func() error {
+						_, err := rc.Increment("legal-item-key", 1, withShardKey)
+						return err
+					},
+					"Decrement": func() error {
+						_, err := rc.Decrement("legal-item-key", 1, withShardKey)
+						return err
+					},
+				}
+
+				for method, call := range calls {
+					if err := call(); !errors.Is(err, ErrMalformedKey) {
+						t.Errorf("%s returned %v, want ErrMalformedKey", method, err)
+					}
+				}
+				recorder.mu.Lock()
+				defer recorder.mu.Unlock()
+				if len(recorder.picked) != 0 {
+					t.Errorf("the selector picked %d times, want no pick", len(recorder.picked))
+				}
+			})
 		}
 	})
 
