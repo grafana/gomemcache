@@ -69,6 +69,12 @@ func WithAllocator(alloc Allocator) Option {
 // the item keys. One response holds all the items, so the caller must limit the
 // number of item keys.
 //
+// The caller owns the choice of the shard key. The client does not check that
+// the items of a shard key fit on one server, or that one server can carry
+// their load. A shard key that groups too many items can fill or overload its
+// server. Spreading the items across servers can also be faster, because the
+// servers work in parallel.
+//
 // The client passes the shard key to the ServerSelector. It does not send the
 // shard key to the server.
 //

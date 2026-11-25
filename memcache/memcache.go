@@ -536,7 +536,7 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 }
 
 func (c *Client) onItem(item *Item, shardKey string, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
-	if !legalShardKey(shardKey) {
+	if !legalKey(item.Key) || !legalShardKey(shardKey) {
 		return ErrMalformedKey
 	}
 	addr, err := c.selector.PickServer(selectorKey(item.Key, shardKey))

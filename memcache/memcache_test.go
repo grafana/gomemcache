@@ -1661,29 +1661,35 @@ func TestWithShardKey(t *testing.T) {
 		}
 	})
 
-	t.Run("methods with a legal shard key return ErrMalformedKey for an illegal item key", func(t *testing.T) {
+	t.Run("every method returns ErrMalformedKey and opens no connection for an illegal item key with a legal shard key", func(t *testing.T) {
+		var dials atomic.Int32
+		rc := NewFromSelector(servers)
+		rc.DialTimeout = func(network, address string, timeout time.Duration) (net.Conn, error) {
+			dials.Add(1)
+			return net.DialTimeout(network, address, timeout)
+		}
+		t.Cleanup(rc.Close)
+
 		illegal := "not legal"
 		withShardKey := WithShardKey("object-j")
+		newItem := func() *Item { return &Item{Key: illegal, Value: []byte("v")} }
 		calls := map[string]func() error{
 			"Get": func() error {
-				_, err := c.Get(illegal, withShardKey)
+				_, err := rc.Get(illegal, withShardKey)
 				return err
 			},
-			"Set": func() error {
-				return c.Set(&Item{Key: illegal, Value: []byte("v")}, withShardKey)
-			},
-			"Touch": func() error {
-				return c.Touch(illegal, 100, withShardKey)
-			},
-			"Delete": func() error {
-				return c.Delete(illegal, withShardKey)
-			},
+			"Set":            func() error { return rc.Set(newItem(), withShardKey) },
+			"Add":            func() error { return rc.Add(newItem(), withShardKey) },
+			"Replace":        func() error { return rc.Replace(newItem(), withShardKey) },
+			"CompareAndSwap": func() error { return rc.CompareAndSwap(newItem(), withShardKey) },
+			"Touch":          func() error { return rc.Touch(illegal, 100, withShardKey) },
+			"Delete":         func() error { return rc.Delete(illegal, withShardKey) },
 			"Increment": func() error {
-				_, err := c.Increment(illegal, 1, withShardKey)
+				_, err := rc.Increment(illegal, 1, withShardKey)
 				return err
 			},
 			"Decrement": func() error {
-				_, err := c.Decrement(illegal, 1, withShardKey)
+				_, err := rc.Decrement(illegal, 1, withShardKey)
 				return err
 			},
 		}
@@ -1692,6 +1698,9 @@ func TestWithShardKey(t *testing.T) {
 			if err := call(); !errors.Is(err, ErrMalformedKey) {
 				t.Errorf("%s returned %v, want ErrMalformedKey", name, err)
 			}
+		}
+		if got := dials.Load(); got != 0 {
+			t.Errorf("the client opened %d connections, want none", got)
 		}
 	})
 }
