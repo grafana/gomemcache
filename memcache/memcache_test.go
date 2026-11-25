@@ -19,6 +19,7 @@ package memcache
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -345,6 +346,43 @@ func testWithClient(t *testing.T, c *Client) {
 		_, err = c.Get("foo")
 		if err != nil && err != ErrCacheMiss {
 			t.Errorf("Connection should be usable after cancelled GetMulti: got err=%v", err)
+		}
+	})
+
+	t.Run("setmulti", func(t *testing.T) {
+		const numItems = 64
+		items := getItems(numItems)
+
+		res, err := c.SetMulti(items, 4)
+		checkErr(err, "fatal error from SetMulti: %s", err)
+		if res.Submitted != numItems {
+			t.Fatalf("expected %d items to be submitted, got %d. res: %+v", numItems, res.Submitted, res)
+		}
+		if res.Stored() != numItems {
+			t.Fatalf("expected %d items to be stored, got %d. res: %+v", numItems, res.Stored(), res)
+		}
+
+		for _, item := range items {
+			read, err := c.Get(item.Key)
+			checkErr(err, "failed to fetch stored '%s'", item.Key)
+			if read.Flags != item.Flags {
+				t.Fatalf("flags for %s not set. expected %d. got %d", item.Key, item.Flags, read.Flags)
+			}
+			if !bytes.Equal(item.Value, read.Value) {
+				t.Fatalf("payload for %s does not match expected value. expected %s. got %s", item.Key, string(item.Value), string(read.Value))
+			}
+		}
+	})
+
+	t.Run("setmulti malformed key", func(t *testing.T) {
+		items := []*Item{
+			{Key: "invalid key", Value: make([]byte, 128)},
+			{Key: "key-2", Value: make([]byte, 128)},
+		}
+
+		res, err := c.SetMulti(items, 1)
+		if err == nil {
+			t.Fatalf("expected fatal error from SetMulti for invalid key: %+v", res)
 		}
 	})
 
@@ -1128,6 +1166,72 @@ func BenchmarkFreeConnectionStripeLayout(b *testing.B) {
 	})
 }
 
+const benchSetNumItems = 16
+
+func getItems(count int) []*Item {
+	var out []*Item
+
+	for i := range count {
+		out = append(out, &Item{
+			Key:        fmt.Sprintf("something-%d", i),
+			Flags:      uint32(i + 1),
+			Value:      []byte("Fuga dolores est optio eius ratione dolores. Illum quas nihil recusandae inventore iusto soluta at. Et qui numquam illum explicabo officia"),
+			Expiration: 300,
+		})
+	}
+
+	return out
+}
+
+func BenchmarkSetSingle(b *testing.B) {
+	startServer(b, "localhost", 11211)
+	startServer(b, "localhost", 11221)
+	c := New(
+		net.JoinHostPort("localhost", strconv.Itoa(11211)),
+		net.JoinHostPort("localhost", strconv.Itoa(11221)),
+	)
+	b.Cleanup(func() {
+		c.Close()
+	})
+
+	_ = c.Ping()
+	items := getItems(benchSetNumItems)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, item := range items {
+			if err := c.Set(item); err != nil {
+				b.Fatalf("unexpected error: %s", err)
+			}
+		}
+	}
+}
+
+func BenchmarkSetMulti(b *testing.B) {
+	// Start two servers because the SetMulti method takes shortcuts
+	// when there's only a single server. This gives us a good idea
+	// of the worst case performance (channels + goroutines).
+	startServer(b, "localhost", 11211)
+	startServer(b, "localhost", 11221)
+	c := New(
+		net.JoinHostPort("localhost", strconv.Itoa(11211)),
+		net.JoinHostPort("localhost", strconv.Itoa(11221)),
+	)
+	b.Cleanup(func() {
+		c.Close()
+	})
+
+	_ = c.Ping()
+	items := getItems(benchSetNumItems)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.SetMulti(items, benchSetNumItems); err != nil {
+			b.Fatalf("unexpected error: %s", err)
+		}
+	}
+}
+
 func BenchmarkScanGetResponseLine(b *testing.B) {
 	line := []byte("VALUE foobar1234 0 4096 1234\r\n")
 	var it Item
@@ -1444,6 +1548,19 @@ func TestWithShardKey(t *testing.T) {
 		}
 		if _, err := c.Get(key, withShardKey); !errors.Is(err, ErrCacheMiss) {
 			t.Fatalf("Get after Delete returned %v, want ErrCacheMiss", err)
+		}
+	})
+
+	t.Run("SetMulti acts on an item that sits on the server of the shard key", func(t *testing.T) {
+		key := "setmulti-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		withShardKey := WithShardKey(shardKey)
+		if _, err := c.SetMulti([]*Item{{Key: key, Expiration: 300, Value: []byte("10")}}, 1, withShardKey); err != nil {
+			t.Fatalf("SetMulti: %v", err)
+		}
+		_, err := c.Get(key, withShardKey)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
 		}
 	})
 

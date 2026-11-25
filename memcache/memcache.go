@@ -27,6 +27,7 @@ import (
 	"math"
 	"math/bits"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,16 +143,19 @@ func nextPowerTwo(n int) int {
 }
 
 var (
-	crlf            = []byte("\r\n")
-	resultOK        = []byte("OK\r\n")
-	resultStored    = []byte("STORED\r\n")
-	resultNotStored = []byte("NOT_STORED\r\n")
-	resultExists    = []byte("EXISTS\r\n")
-	resultNotFound  = []byte("NOT_FOUND\r\n")
-	resultDeleted   = []byte("DELETED\r\n")
-	resultEnd       = []byte("END\r\n")
-	resultOk        = []byte("OK\r\n")
-	resultTouched   = []byte("TOUCHED\r\n")
+	crlf                = []byte("\r\n")
+	metaNop             = []byte("mn\r\n")
+	resultOK            = []byte("OK\r\n")
+	resultMetaNop       = []byte("MN\r\n")
+	resultMetaNotStored = []byte("NS\r\n")
+	resultStored        = []byte("STORED\r\n")
+	resultNotStored     = []byte("NOT_STORED\r\n")
+	resultExists        = []byte("EXISTS\r\n")
+	resultNotFound      = []byte("NOT_FOUND\r\n")
+	resultDeleted       = []byte("DELETED\r\n")
+	resultEnd           = []byte("END\r\n")
+	resultOk            = []byte("OK\r\n")
+	resultTouched       = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
 	resultServerErrorPrefix = []byte("SERVER_ERROR ")
@@ -880,6 +884,197 @@ func cut(s string, sep byte) (before, after string, found bool) {
 		return s[:i], s[i+1:], true
 	}
 	return s, "", false
+}
+
+// StorageMultiResult describes the results of setting multiple cache
+// entries at once.
+type StorageMultiResult struct {
+	// NotStored is the number of items that could not be stored due to
+	// a non-exceptional error (the server understood our request but did
+	// not store the item anyway).
+	NotStored int
+
+	// Submitted is the number of items that we attempted to store without
+	// encountering a terminal error (network issues, invalid response).
+	Submitted int
+
+	// ServerErrors are any errors originating from server (as opposed to
+	// an error that indicates the client made a mistake) while attempting
+	// to store an item in the batch.
+	ServerErrors []error
+}
+
+// Stored returns the number of items that we know were stored in the cache
+// and not discarded due to errors, invalid data, etc. When writes encounter
+// terminal errors (network issues, invalid responses) after writing some items,
+// this may undercount the number of items that were stored.
+func (r StorageMultiResult) Stored() int {
+	return r.Submitted - r.NotStored - len(r.ServerErrors)
+}
+
+func (r *StorageMultiResult) add(other StorageMultiResult) {
+	r.Submitted += other.Submitted
+	r.NotStored += other.NotStored
+	r.ServerErrors = append(r.ServerErrors, other.ServerErrors...)
+}
+
+type resultErrPair struct {
+	res StorageMultiResult
+	err error
+}
+
+// SetMulti is a batch version of Set that writes multiple items to their
+// appropriate server.
+//
+// If there are no terminal errors (network issues, invalid responses), the results
+// of writing items are returned in a result object with counts of what happened
+// to the items. If there are terminal errors, results may be incomplete. Even when
+// there are no terminal errors it may still be the case that items were not stored
+// in the cache. Callers must check the result object for counts of items that were
+// not stored or server errors encountered.
+//
+// batchSize controls how many items are written to a server at a time and must be
+// at least 1. Each batch must be written to a server within the timeout being used
+// and so should not be huge. A batch size of 8 to 64 is a reasonable default.
+func (c *Client) SetMulti(items []*Item, batchSize int, opts ...Option) (StorageMultiResult, error) {
+	if batchSize < 1 {
+		return StorageMultiResult{}, fmt.Errorf("batch size must be at least 1, got %d", batchSize)
+	}
+
+	shardKey := shardKeyOf(opts)
+	if !legalShardKey(shardKey) {
+		return StorageMultiResult{}, ErrMalformedKey
+	}
+
+	itemMap := make(map[net.Addr][]*Item)
+	for _, item := range items {
+		if !legalKey(item.Key) {
+			return StorageMultiResult{}, ErrMalformedKey
+		}
+		addr, err := c.selector.PickServer(selectorKey(item.Key, shardKey))
+		if err != nil {
+			return StorageMultiResult{}, err
+		}
+		itemMap[addr] = append(itemMap[addr], item)
+	}
+
+	// If we're only setting items on a single server there's no benefit to parallelizing
+	// it but items will still be batched to reduced network round-trips.
+	if len(itemMap) == 1 {
+		for k, v := range itemMap {
+			return c.setAddr(k, v, batchSize)
+		}
+	}
+
+	ch := make(chan resultErrPair, buffered)
+	for serverAddr, serverItems := range itemMap {
+		go func(addr net.Addr, items []*Item) {
+			res, err := c.setAddr(addr, items, batchSize)
+			ch <- resultErrPair{res: res, err: err}
+		}(serverAddr, serverItems)
+	}
+
+	var (
+		fatals []error
+		out    StorageMultiResult
+	)
+
+	for i := 0; i < len(itemMap); i++ {
+		pair := <-ch
+		if pair.err != nil {
+			fatals = append(fatals, pair.err)
+		}
+
+		out.add(pair.res)
+	}
+
+	return out, errors.Join(fatals...)
+}
+
+func (c *Client) setAddr(addr net.Addr, items []*Item, batchSize int) (StorageMultiResult, error) {
+	cn, err := c.getConn(addr)
+	if err != nil {
+		return StorageMultiResult{}, err
+	}
+
+	// Note that we are capturing err here. We need to assign to err in any other code in
+	// this method, not redeclare it, or we risk a bad connection being returned to the pool.
+	defer cn.condRelease(&err)
+
+	var out StorageMultiResult
+	for chunk := range slices.Chunk(items, batchSize) {
+		cn.extendDeadline()
+
+		var result StorageMultiResult
+		result, err = c.populateSetBatch(cn.rw, chunk)
+		if err != nil {
+			return out, err
+		}
+
+		out.add(result)
+	}
+
+	return out, nil
+}
+
+func (c *Client) populateSetBatch(rw *bufio.ReadWriter, items []*Item) (StorageMultiResult, error) {
+	for _, item := range items {
+		_, err := fmt.Fprintf(rw, "ms %s %d q T%d F%d\r\n", item.Key, len(item.Value), item.Expiration, item.Flags)
+		if err != nil {
+			return StorageMultiResult{}, err
+		}
+		if _, err = rw.Write(item.Value); err != nil {
+			return StorageMultiResult{}, err
+		}
+		if _, err = rw.Write(crlf); err != nil {
+			return StorageMultiResult{}, err
+		}
+	}
+
+	// We're using the quiet flag, `q`, above so we don't know if we should expect
+	// any response on the connection (there's no response on success but errors are
+	// returned). Send a "no-op" command at the end so that when we get a response
+	// to the no-op command, we know we've already parsed any possible output from
+	// the store commands.
+	if _, err := rw.Write(metaNop); err != nil {
+		return StorageMultiResult{}, err
+	}
+
+	if err := rw.Flush(); err != nil {
+		return StorageMultiResult{}, err
+	}
+
+	result := StorageMultiResult{Submitted: len(items)}
+
+	for {
+		line, err := rw.ReadSlice('\n')
+		if err != nil {
+			return StorageMultiResult{}, err
+		}
+
+		// We're done parsing potential errors from the storage command after
+		// we get the response for the no-op command we sent after all of them.
+		if bytes.Equal(line, resultMetaNop) {
+			break
+		}
+
+		// Note that we aren't checking for `HD`, "stored", here because we're
+		// using quiet mode via the `q` flag above. There won't be any response
+		// on success. We don't check for `EX` or `NF`, "exists" and "not found"
+		// respectively, since we aren't using the compare-and-swap flag.
+		switch {
+		case bytes.Equal(line, resultMetaNotStored):
+			result.NotStored++
+		default:
+			if err = serverErrorFromLine(line); err != nil {
+				result.ServerErrors = append(result.ServerErrors, err)
+			} else {
+				return StorageMultiResult{}, fmt.Errorf("memcache: unexpected response line from ms: %q", string(line))
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // Set writes the given item, unconditionally.
