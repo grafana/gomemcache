@@ -887,35 +887,45 @@ func cut(s string, sep byte) (before, after string, found bool) {
 }
 
 // StorageMultiResult describes the results of setting multiple cache
-// entries at once.
+// entries at once. The counters are mutually exclusive and sum to the
+// number of Item attempted to be stored.
 type StorageMultiResult struct {
-	// NotStored is the number of items that could not be stored due to
-	// a non-exceptional error (the server understood our request but did
-	// not store the item anyway).
+	// Failed is the number of items that either failed due to a fatal
+	// error or are unknown because we can't tell if they were written
+	// successfully.
+	Failed int
+
+	// NotStored is the number of items that Memcached explicitly chose not
+	// to store and returned a response to indicate this.
 	NotStored int
 
-	// Submitted is the number of items that we attempted to store without
-	// encountering a terminal error (network issues, invalid response).
-	Submitted int
+	// Rejected is the number of items that we didn't attempt to write due
+	// to invalid data or an internal error that prevented the attempt (e.g.
+	// they had an invalid key or we couldn't determine the right server
+	// for them).
+	Rejected int
 
-	// ServerErrors are any errors originating from server (as opposed to
-	// an error that indicates the client made a mistake) while attempting
-	// to store an item in the batch.
-	ServerErrors []error
-}
+	// ServerErrors is the number of items that resulted in an explicit server
+	// error from Memcached.
+	ServerErrors int
 
-// Stored returns the number of items that we know were stored in the cache
-// and not discarded due to errors, invalid data, etc. When writes encounter
-// terminal errors (network issues, invalid responses) after writing some items,
-// this may undercount the number of items that were stored.
-func (r StorageMultiResult) Stored() int {
-	return r.Submitted - r.NotStored - len(r.ServerErrors)
+	// Stored is the number of items that were successfully written to Memcached.
+	Stored int
+
+	// FirstServerError is the error associated with the first ServerErrors
+	// response from Memcached. It is included to aid in debugging.
+	FirstServerError error
 }
 
 func (r *StorageMultiResult) add(other StorageMultiResult) {
-	r.Submitted += other.Submitted
+	r.Failed += other.Failed
 	r.NotStored += other.NotStored
-	r.ServerErrors = append(r.ServerErrors, other.ServerErrors...)
+	r.Rejected += other.Rejected
+	r.ServerErrors += other.ServerErrors
+	r.Stored += other.Stored
+	if r.FirstServerError == nil {
+		r.FirstServerError = other.FirstServerError
+	}
 }
 
 type resultErrPair struct {
@@ -926,34 +936,37 @@ type resultErrPair struct {
 // SetMulti is a batch version of Set that writes multiple items to their
 // appropriate server.
 //
-// If there are no terminal errors (network issues, invalid responses), the results
-// of writing items are returned in a result object with counts of what happened
-// to the items. If there are terminal errors, results may be incomplete. Even when
-// there are no terminal errors it may still be the case that items were not stored
-// in the cache. Callers must check the result object for counts of items that were
-// not stored or server errors encountered.
-//
 // batchSize controls how many items are written to a server at a time and must be
 // at least 1. Each batch must be written to a server within the timeout being used
 // and so should not be huge. A batch size of 8 to 64 is a reasonable default.
 func (c *Client) SetMulti(items []*Item, batchSize int, opts ...Option) (StorageMultiResult, error) {
+	res, err := c.setMulti(items, batchSize, opts...)
+	// Anything not explicitly rejected, stored, not-stored, or that resulted in
+	// a server error counts as failed. Failed items are unknown because we don't
+	// know if they actually made it to the cache when we get a network error or
+	// similar.
+	res.Failed = len(items) - res.Rejected - res.Stored - res.NotStored - res.ServerErrors
+	return res, err
+}
+
+func (c *Client) setMulti(items []*Item, batchSize int, opts ...Option) (StorageMultiResult, error) {
 	if batchSize < 1 {
-		return StorageMultiResult{}, fmt.Errorf("batch size must be at least 1, got %d", batchSize)
+		return StorageMultiResult{Rejected: len(items)}, fmt.Errorf("batch size must be at least 1, got %d", batchSize)
 	}
 
 	shardKey := shardKeyOf(opts)
 	if !legalShardKey(shardKey) {
-		return StorageMultiResult{}, ErrMalformedKey
+		return StorageMultiResult{Rejected: len(items)}, ErrMalformedKey
 	}
 
 	itemMap := make(map[net.Addr][]*Item)
 	for _, item := range items {
 		if !legalKey(item.Key) {
-			return StorageMultiResult{}, ErrMalformedKey
+			return StorageMultiResult{Rejected: len(items)}, ErrMalformedKey
 		}
 		addr, err := c.selector.PickServer(selectorKey(item.Key, shardKey))
 		if err != nil {
-			return StorageMultiResult{}, err
+			return StorageMultiResult{Rejected: len(items)}, err
 		}
 		itemMap[addr] = append(itemMap[addr], item)
 	}
@@ -1018,6 +1031,11 @@ func (c *Client) setAddr(addr net.Addr, items []*Item, batchSize int) (StorageMu
 }
 
 func (c *Client) populateSetBatch(rw *bufio.ReadWriter, items []*Item) (StorageMultiResult, error) {
+	// Fatal errors (errors doing reads or writes) result in returning an empty
+	// result object. This is important because we compute "failed" items later
+	// as any items that we don't have an explicit response (success or not) for.
+	// By not including the items in a Rejected/Stored/NotStored/ServerError counter
+	// we're indicating that they are "failed".
 	for _, item := range items {
 		_, err := fmt.Fprintf(rw, "ms %s %d q T%d F%d\r\n", item.Key, len(item.Value), item.Expiration, item.Flags)
 		if err != nil {
@@ -1044,7 +1062,7 @@ func (c *Client) populateSetBatch(rw *bufio.ReadWriter, items []*Item) (StorageM
 		return StorageMultiResult{}, err
 	}
 
-	result := StorageMultiResult{Submitted: len(items)}
+	result := StorageMultiResult{}
 
 	for {
 		line, err := rw.ReadSlice('\n')
@@ -1067,13 +1085,19 @@ func (c *Client) populateSetBatch(rw *bufio.ReadWriter, items []*Item) (StorageM
 			result.NotStored++
 		default:
 			if err = serverErrorFromLine(line); err != nil {
-				result.ServerErrors = append(result.ServerErrors, err)
+				result.ServerErrors++
+				if result.FirstServerError == nil {
+					result.FirstServerError = err
+				}
 			} else {
 				return StorageMultiResult{}, fmt.Errorf("memcache: unexpected response line from ms: %q", string(line))
 			}
 		}
 	}
 
+	// We haven't hit a fatal error and returned early so anything we didn't
+	// get an error response for means it was stored.
+	result.Stored = len(items) - result.NotStored - result.ServerErrors
 	return result, nil
 }
 
