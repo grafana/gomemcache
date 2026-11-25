@@ -89,7 +89,7 @@ func TestLocalhost(t *testing.T) {
 	testWithClient(t, c)
 }
 
-func TestShardedServers(t *testing.T) {
+func TestStripedServers(t *testing.T) {
 	startServer(t, "localhost", 11221)
 	startServer(t, "localhost", 11231)
 
@@ -101,7 +101,7 @@ func TestShardedServers(t *testing.T) {
 		t.Fatalf("unable to set servers in selector: %s", err)
 	}
 
-	c := NewShardedFromSelector(servers, 2)
+	c := NewStripedFromSelector(servers, 2)
 	t.Cleanup(c.Close)
 
 	testWithClient(t, c)
@@ -525,10 +525,10 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 	}
 
 	countFreeConns := func(c *Client) (recentlyUsed, idle int) {
-		for _, shard := range c.shards {
-			shard.mtx.Lock()
+		for _, stripe := range c.stripes {
+			stripe.mtx.Lock()
 
-			for _, freeConnections := range shard.free {
+			for _, freeConnections := range stripe.free {
 				for _, freeConn := range freeConnections {
 					if time.Since(freeConn.idleSince) >= c.RecentlyUsedConnsThreshold {
 						idle++
@@ -538,7 +538,7 @@ func TestClient_releaseIdleConnections(t *testing.T) {
 				}
 			}
 
-			shard.mtx.Unlock()
+			stripe.mtx.Unlock()
 		}
 
 		return
@@ -803,10 +803,10 @@ func TestServerError_KeepsConnectionOpen(t *testing.T) {
 	countFreeConns := func(c *Client) int {
 		total := 0
 
-		for _, shard := range c.shards {
-			shard.mtx.Lock()
-			total += len(shard.free[dummyAddr{}.String()])
-			shard.mtx.Unlock()
+		for _, stripe := range c.stripes {
+			stripe.mtx.Lock()
+			total += len(stripe.free[dummyAddr{}.String()])
+			stripe.mtx.Unlock()
 		}
 
 		return total
@@ -1070,13 +1070,13 @@ func BenchmarkOnItem(b *testing.B) {
 	dummyFn := func(_ *Client, _ *bufio.ReadWriter, _ *Item) error { return nil }
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = c.onItem(&item, dummyFn)
+		_ = c.onItem(&item, "", dummyFn)
 	}
 }
 
-func BenchmarkPickShard(b *testing.B) {
+func BenchmarkPickStripe(b *testing.B) {
 	c := Client{}
-	c.shards = []*freeConnectionShard{
+	c.stripes = []*freeConnectionStripe{
 		{
 			mtx:  sync.Mutex{},
 			free: make(map[string][]*conn),
@@ -1097,20 +1097,20 @@ func BenchmarkPickShard(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for i := range keys {
-			_ = c.pickShard(keys[i])
+			_ = c.pickStripe(keys[i])
 		}
 	}
 }
 
-// Benchmark the effect of adding padding to freeConnectionShard to make sure
-// each shard is on a different cache line (usually 64 bytes) which avoids false
+// Benchmark the effect of adding padding to freeConnectionStripe to make sure
+// each stripe is on a different cache line (usually 64 bytes) which avoids false
 // sharing.
-func BenchmarkFreeConnectionShardLayout(b *testing.B) {
-	const numShards = 16
+func BenchmarkFreeConnectionStripeLayout(b *testing.B) {
+	const numStripes = 16
 
-	shards := make([]*freeConnectionShard, numShards)
-	for i := range numShards {
-		shards[i] = &freeConnectionShard{
+	stripes := make([]*freeConnectionStripe, numStripes)
+	for i := range numStripes {
+		stripes[i] = &freeConnectionStripe{
 			mtx:  sync.Mutex{},
 			free: make(map[string][]*conn),
 		}
@@ -1118,12 +1118,12 @@ func BenchmarkFreeConnectionShardLayout(b *testing.B) {
 
 	var idx atomic.Int32
 	b.RunParallel(func(pb *testing.PB) {
-		shard := shards[int(idx.Add(1))%len(shards)]
+		stripe := stripes[int(idx.Add(1))%len(stripes)]
 		for pb.Next() {
-			// Without padding, locking the mutex of one shard would invalidate
-			// the cached value of an adjacent shard.
-			shard.mtx.Lock()
-			shard.mtx.Unlock() //nolint:staticcheck
+			// Without padding, locking the mutex of one stripe would invalidate
+			// the cached value of an adjacent stripe.
+			stripe.mtx.Lock()
+			stripe.mtx.Unlock() //nolint:staticcheck
 		}
 	})
 }
@@ -1225,4 +1225,612 @@ func (m *mockAllocator) Get(sz int) *[]byte {
 
 func (m *mockAllocator) Put(b *[]byte) {
 	m.put(b)
+}
+
+func TestWithShardKey(t *testing.T) {
+	ports := []int{11241, 11251, 11261}
+	addrs := make([]string, len(ports))
+	direct := make([]*Client, len(ports))
+	for i, port := range ports {
+		startServer(t, "localhost", port)
+		addrs[i] = net.JoinHostPort("localhost", strconv.Itoa(port))
+		direct[i] = New(addrs[i])
+		t.Cleanup(direct[i].Close)
+	}
+
+	servers := &ServerList{}
+	if err := servers.SetServers(addrs...); err != nil {
+		t.Fatalf("unable to set servers in selector: %s", err)
+	}
+	selector := &recordingSelector{ServerSelector: servers}
+	c := NewFromSelector(selector)
+	t.Cleanup(c.Close)
+
+	ctx := context.Background()
+
+	t.Run("GetMulti with the shard key finds the items that Set stored on one server", func(t *testing.T) {
+		keys := storeItems(t, c, servers, "found", 20, "object-a")
+
+		got, err := c.GetMulti(ctx, keys, WithShardKey("object-a"))
+		if err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		if len(got) != len(keys) {
+			t.Fatalf("GetMulti found %d of %d items", len(got), len(keys))
+		}
+		for _, key := range keys {
+			if string(got[key].Value) != key {
+				t.Fatalf("GetMulti returned value %q for key %q", got[key].Value, key)
+			}
+		}
+
+		holders := 0
+		for i, d := range direct {
+			onServer, err := d.GetMulti(ctx, keys)
+			if err != nil {
+				t.Fatalf("GetMulti on server %d: %v", i, err)
+			}
+			switch len(onServer) {
+			case len(keys):
+				holders++
+			case 0:
+			default:
+				t.Fatalf("server %d holds %d of %d items, want all or none", i, len(onServer), len(keys))
+			}
+		}
+		if holders != 1 {
+			t.Fatalf("%d servers hold the items, want 1", holders)
+		}
+	})
+
+	t.Run("GetMulti without the shard key misses the items that Set stored with one", func(t *testing.T) {
+		keys := storeItems(t, c, servers, "missed", 20, "object-b")
+
+		got, err := c.GetMulti(ctx, keys)
+		if err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		if len(got) >= len(keys) {
+			t.Fatalf("GetMulti found %d of %d items without the shard key", len(got), len(keys))
+		}
+	})
+
+	t.Run("GetMulti with the shard key asks the selector once, with the shard key", func(t *testing.T) {
+		keys := storeItems(t, c, servers, "once", 5, "object-c")
+		selector.reset()
+
+		if _, err := c.GetMulti(ctx, keys, WithShardKey("object-c")); err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		if got := selector.pickedKeys(); !slices.Equal(got, []string{"object-c"}) {
+			t.Fatalf("the selector picked %q, want only the shard key", got)
+		}
+	})
+
+	t.Run("GetMulti without the shard key asks the selector for each key", func(t *testing.T) {
+		keys := storeItems(t, c, servers, "each", 5, "")
+		selector.reset()
+
+		if _, err := c.GetMulti(ctx, keys); err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		picked := selector.pickedKeys()
+		slices.Sort(picked)
+		want := slices.Clone(keys)
+		slices.Sort(want)
+		if !slices.Equal(picked, want) {
+			t.Fatalf("the selector picked %q, want %q", picked, want)
+		}
+	})
+
+	t.Run("GetMulti with the shard key and no keys asks no server", func(t *testing.T) {
+		selector.reset()
+
+		got, err := c.GetMulti(ctx, nil, WithShardKey("object-d"))
+		if err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Fatalf("GetMulti returned %v, want an empty map", got)
+		}
+		if picked := selector.pickedKeys(); len(picked) != 0 {
+			t.Fatalf("the selector picked %q, want nothing", picked)
+		}
+	})
+
+	t.Run("GetMulti with the shard key returns ErrMalformedKey for an illegal key", func(t *testing.T) {
+		selector.reset()
+
+		_, err := c.GetMulti(ctx, []string{"legal", "not legal"}, WithShardKey("object-e"))
+		if !errors.Is(err, ErrMalformedKey) {
+			t.Fatalf("GetMulti returned %v, want ErrMalformedKey", err)
+		}
+		if picked := selector.pickedKeys(); len(picked) != 0 {
+			t.Fatalf("the selector picked %q, want nothing", picked)
+		}
+	})
+
+	t.Run("Get finds an item that Set stored with the shard key", func(t *testing.T) {
+		key := "get-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		if err := c.Set(&Item{Key: key, Value: []byte("v")}, WithShardKey(shardKey)); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		item, err := c.Get(key, WithShardKey(shardKey))
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if string(item.Value) != "v" {
+			t.Fatalf("Get returned value %q, want %q", item.Value, "v")
+		}
+		if _, err := c.Get(key); !errors.Is(err, ErrCacheMiss) {
+			t.Fatalf("Get without the shard key returned %v, want ErrCacheMiss", err)
+		}
+	})
+
+	t.Run("Add and Replace use the server of the shard key", func(t *testing.T) {
+		key := "add-replace-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		withShardKey := WithShardKey(shardKey)
+
+		if err := c.Replace(&Item{Key: key, Value: []byte("1")}, withShardKey); !errors.Is(err, ErrNotStored) {
+			t.Fatalf("Replace of a missing item returned %v, want ErrNotStored", err)
+		}
+		if err := c.Add(&Item{Key: key, Value: []byte("1")}, withShardKey); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		if err := c.Add(&Item{Key: key, Value: []byte("2")}, withShardKey); !errors.Is(err, ErrNotStored) {
+			t.Fatalf("Add of an existing item returned %v, want ErrNotStored", err)
+		}
+		if err := c.Replace(&Item{Key: key, Value: []byte("3")}, withShardKey); err != nil {
+			t.Fatalf("Replace: %v", err)
+		}
+
+		item, err := c.Get(key, withShardKey)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if string(item.Value) != "3" {
+			t.Fatalf("Get returned value %q, want %q", item.Value, "3")
+		}
+	})
+
+	t.Run("CompareAndSwap swaps an item that sits on the server of the shard key", func(t *testing.T) {
+		key := "cas-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		withShardKey := WithShardKey(shardKey)
+		if err := c.Set(&Item{Key: key, Value: []byte("old")}, withShardKey); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		item, err := c.Get(key, withShardKey)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		item.Value = []byte("new")
+		if err := c.CompareAndSwap(item, withShardKey); err != nil {
+			t.Fatalf("CompareAndSwap: %v", err)
+		}
+
+		item, err = c.Get(key, withShardKey)
+		if err != nil {
+			t.Fatalf("Get after CompareAndSwap: %v", err)
+		}
+		if string(item.Value) != "new" {
+			t.Fatalf("Get returned value %q, want %q", item.Value, "new")
+		}
+	})
+
+	t.Run("Touch, Increment, Decrement and Delete act on an item that sits on the server of the shard key", func(t *testing.T) {
+		key := "counter-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		withShardKey := WithShardKey(shardKey)
+		if err := c.Set(&Item{Key: key, Value: []byte("10")}, withShardKey); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		if err := c.Touch(key, 100, withShardKey); err != nil {
+			t.Fatalf("Touch: %v", err)
+		}
+		if got, err := c.Increment(key, 5, withShardKey); err != nil || got != 15 {
+			t.Fatalf("Increment returned %d, %v, want 15, nil", got, err)
+		}
+		if got, err := c.Decrement(key, 3, withShardKey); err != nil || got != 12 {
+			t.Fatalf("Decrement returned %d, %v, want 12, nil", got, err)
+		}
+		if err := c.Delete(key, withShardKey); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if _, err := c.Get(key, withShardKey); !errors.Is(err, ErrCacheMiss) {
+			t.Fatalf("Get after Delete returned %v, want ErrCacheMiss", err)
+		}
+	})
+
+	t.Run("GetMulti with the shard key returns the items that arrived before a server error", func(t *testing.T) {
+		type result struct {
+			items map[string]*Item
+			err   error
+		}
+		fakeClient, srvw, srvReqs := getClientWithFakeServer(t)
+		fakeClient.Timeout = time.Second
+		resCh := make(chan result, 1)
+		go func() {
+			items, err := fakeClient.GetMulti(ctx, []string{"key1", "key2"}, WithShardKey("object-g"))
+			resCh <- result{items, err}
+		}()
+
+		select {
+		case req := <-srvReqs:
+			if req != "gets key1 key2\r\n" {
+				t.Fatalf("GetMulti sent %q, want one gets command with the item keys only", req)
+			}
+		case res := <-resCh:
+			t.Fatalf("GetMulti returned %v before it sent a request", res.err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("GetMulti sent no request")
+		}
+		if _, err := io.WriteString(srvw, "VALUE key1 0 5 1\r\nhello\r\nSERVER_ERROR out of memory\r\n"); err != nil {
+			t.Fatalf("write the server response: %v", err)
+		}
+
+		select {
+		case res := <-resCh:
+			if !errors.Is(res.err, ErrServerError) {
+				t.Fatalf("GetMulti returned %v, want ErrServerError", res.err)
+			}
+			if item, ok := res.items["key1"]; !ok || string(item.Value) != "hello" {
+				t.Fatalf("GetMulti returned %v, want the item that arrived before the error", res.items)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("GetMulti did not return")
+		}
+	})
+
+	t.Run("GetMulti with the shard key returns ErrNoServers when the selector has no server", func(t *testing.T) {
+		noServers := NewFromSelector(&ServerList{})
+		t.Cleanup(noServers.Close)
+
+		_, err := noServers.GetMulti(ctx, []string{"key"}, WithShardKey("object-h"))
+		if !errors.Is(err, ErrNoServers) {
+			t.Fatalf("GetMulti returned %v, want ErrNoServers", err)
+		}
+	})
+
+	t.Run("GetMulti returns the items of a live server together with the error of a dead server", func(t *testing.T) {
+		mixed := &ServerList{}
+		if err := mixed.SetServers(addrs[0], closedAddr(t)); err != nil {
+			t.Fatalf("unable to set servers in selector: %s", err)
+		}
+		mixedClient := NewFromSelector(mixed)
+		t.Cleanup(mixedClient.Close)
+
+		var keys []string
+		if err := mixed.Each(func(addr net.Addr) error {
+			keys = append(keys, keyOnServer(t, mixed, addr, "mixed"))
+			return nil
+		}); err != nil {
+			t.Fatalf("Each: %v", err)
+		}
+		if err := direct[0].Set(&Item{Key: keys[0], Value: []byte("live")}); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		got, err := mixedClient.GetMulti(ctx, keys)
+		if err == nil {
+			t.Fatalf("GetMulti returned no error, want the error of the dead server")
+		}
+		if item, ok := got[keys[0]]; !ok || string(item.Value) != "live" {
+			t.Fatalf("GetMulti returned %v, want the item of the live server", got)
+		}
+	})
+
+	t.Run("GetMulti finds the items with the shard key and the allocator in either option order", func(t *testing.T) {
+		keys := storeItems(t, c, servers, "alloc", 5, "object-i")
+		alloc := newTestAllocator(1024)
+
+		for _, opts := range [][]Option{
+			{WithAllocator(alloc), WithShardKey("object-i")},
+			{WithShardKey("object-i"), WithAllocator(alloc)},
+		} {
+			getsBefore := alloc.numGets
+			got, err := c.GetMulti(ctx, keys, opts...)
+			if err != nil {
+				t.Fatalf("GetMulti: %v", err)
+			}
+			if len(got) != len(keys) {
+				t.Fatalf("GetMulti found %d of %d items", len(got), len(keys))
+			}
+			if alloc.numGets == getsBefore {
+				t.Fatalf("GetMulti did not use the allocator")
+			}
+		}
+	})
+
+	t.Run("an empty shard key picks the server of the item key", func(t *testing.T) {
+		key := stringOnOtherServer(t, servers, "")
+		keyAddr, err := servers.PickServer(key)
+		if err != nil {
+			t.Fatalf("PickServer: %v", err)
+		}
+		wantServer := serverIndex(t, servers, keyAddr)
+		if err := c.Set(&Item{Key: key, Value: []byte("v")}, WithShardKey("")); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		for i, d := range direct {
+			_, err := d.Get(key)
+			if holds := err == nil; holds != (i == wantServer) {
+				t.Fatalf("server %d holds the item: %v, want %v", i, holds, i == wantServer)
+			}
+		}
+		if _, err := c.Get(key, WithShardKey("")); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	})
+
+	t.Run("Set, Get and GetMulti accept a shard key of 250 bytes", func(t *testing.T) {
+		key := "longest-shard-key-item"
+		withShardKey := WithShardKey(strings.Repeat("x", 250))
+
+		if err := c.Set(&Item{Key: key, Value: []byte("v")}, withShardKey); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if _, err := c.Get(key, withShardKey); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		got, err := c.GetMulti(ctx, []string{key}, withShardKey)
+		if err != nil {
+			t.Fatalf("GetMulti: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("GetMulti found %d of 1 items", len(got))
+		}
+	})
+
+	t.Run("every method returns ErrMalformedKey and picks no server for an illegal shard key", func(t *testing.T) {
+		illegalShardKeys := map[string]string{
+			"a space":             "not legal",
+			"a control character": "not\x01legal",
+			"a line break":        "not\r\nlegal",
+			"251 bytes":           strings.Repeat("x", 251),
+		}
+
+		for name, shardKey := range illegalShardKeys {
+			t.Run("shard key with "+name, func(t *testing.T) {
+				recorder := &recordingSelector{ServerSelector: servers}
+				rc := NewFromSelector(recorder)
+				t.Cleanup(rc.Close)
+
+				withShardKey := WithShardKey(shardKey)
+				newItem := func() *Item { return &Item{Key: "legal-item-key", Value: []byte("v")} }
+				calls := map[string]func() error{
+					"Get": func() error {
+						_, err := rc.Get("legal-item-key", withShardKey)
+						return err
+					},
+					"GetMulti": func() error {
+						_, err := rc.GetMulti(ctx, []string{"legal-item-key"}, withShardKey)
+						return err
+					},
+					"GetMulti with no item keys": func() error {
+						_, err := rc.GetMulti(ctx, nil, withShardKey)
+						return err
+					},
+					"Set":            func() error { return rc.Set(newItem(), withShardKey) },
+					"Add":            func() error { return rc.Add(newItem(), withShardKey) },
+					"Replace":        func() error { return rc.Replace(newItem(), withShardKey) },
+					"CompareAndSwap": func() error { return rc.CompareAndSwap(newItem(), withShardKey) },
+					"Touch":          func() error { return rc.Touch("legal-item-key", 100, withShardKey) },
+					"Delete":         func() error { return rc.Delete("legal-item-key", withShardKey) },
+					"Increment": func() error {
+						_, err := rc.Increment("legal-item-key", 1, withShardKey)
+						return err
+					},
+					"Decrement": func() error {
+						_, err := rc.Decrement("legal-item-key", 1, withShardKey)
+						return err
+					},
+				}
+
+				for method, call := range calls {
+					if err := call(); !errors.Is(err, ErrMalformedKey) {
+						t.Errorf("%s returned %v, want ErrMalformedKey", method, err)
+					}
+				}
+				recorder.mu.Lock()
+				defer recorder.mu.Unlock()
+				if len(recorder.picked) != 0 {
+					t.Errorf("the selector picked %d times, want no pick", len(recorder.picked))
+				}
+			})
+		}
+	})
+
+	t.Run("the last shard key option of a call wins", func(t *testing.T) {
+		key := "last-wins-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		firstShardKey := stringOnOtherServer(t, servers, shardKey)
+
+		item := &Item{Key: key, Value: []byte("v")}
+		if err := c.Set(item, WithShardKey(firstShardKey), WithShardKey(shardKey)); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if _, err := c.Get(key, WithShardKey(shardKey)); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	})
+
+	t.Run("every method returns ErrMalformedKey and opens no connection for an illegal item key with a legal shard key", func(t *testing.T) {
+		var dials atomic.Int32
+		rc := NewFromSelector(servers)
+		rc.DialTimeout = func(network, address string, timeout time.Duration) (net.Conn, error) {
+			dials.Add(1)
+			return net.DialTimeout(network, address, timeout)
+		}
+		t.Cleanup(rc.Close)
+
+		illegal := "not legal"
+		withShardKey := WithShardKey("object-j")
+		newItem := func() *Item { return &Item{Key: illegal, Value: []byte("v")} }
+		calls := map[string]func() error{
+			"Get": func() error {
+				_, err := rc.Get(illegal, withShardKey)
+				return err
+			},
+			"Set":            func() error { return rc.Set(newItem(), withShardKey) },
+			"Add":            func() error { return rc.Add(newItem(), withShardKey) },
+			"Replace":        func() error { return rc.Replace(newItem(), withShardKey) },
+			"CompareAndSwap": func() error { return rc.CompareAndSwap(newItem(), withShardKey) },
+			"Touch":          func() error { return rc.Touch(illegal, 100, withShardKey) },
+			"Delete":         func() error { return rc.Delete(illegal, withShardKey) },
+			"Increment": func() error {
+				_, err := rc.Increment(illegal, 1, withShardKey)
+				return err
+			},
+			"Decrement": func() error {
+				_, err := rc.Decrement(illegal, 1, withShardKey)
+				return err
+			},
+		}
+
+		for name, call := range calls {
+			if err := call(); !errors.Is(err, ErrMalformedKey) {
+				t.Errorf("%s returned %v, want ErrMalformedKey", name, err)
+			}
+		}
+		if got := dials.Load(); got != 0 {
+			t.Errorf("the client opened %d connections, want none", got)
+		}
+	})
+}
+
+type recordingSelector struct {
+	ServerSelector
+
+	mu     sync.Mutex
+	picked []string
+}
+
+func (s *recordingSelector) PickServer(key string) (net.Addr, error) {
+	s.mu.Lock()
+	s.picked = append(s.picked, key)
+	s.mu.Unlock()
+	return s.ServerSelector.PickServer(key)
+}
+
+func (s *recordingSelector) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.picked = nil
+}
+
+func (s *recordingSelector) pickedKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.picked)
+}
+
+// storeItems stores n items with shardKey, if it is not empty, and returns
+// their keys. The key of item i is prefix-i, and its value is its key. It fails
+// the test when the keys all hash to one server, because GetMulti without the
+// shard key then reaches one server and the test proves nothing.
+func storeItems(t *testing.T, c *Client, servers *ServerList, prefix string, n int, shardKey string) []string {
+	t.Helper()
+
+	var opts []Option
+	if shardKey != "" {
+		opts = append(opts, WithShardKey(shardKey))
+	}
+
+	keys := make([]string, n)
+	owners := map[string]struct{}{}
+	for i := range keys {
+		keys[i] = fmt.Sprintf("%s-%d", prefix, i)
+		addr, err := servers.PickServer(keys[i])
+		if err != nil {
+			t.Fatalf("PickServer: %v", err)
+		}
+		owners[addr.String()] = struct{}{}
+		if err := c.Set(&Item{Key: keys[i], Value: []byte(keys[i])}, opts...); err != nil {
+			t.Fatalf("Set %q: %v", keys[i], err)
+		}
+	}
+	if len(owners) < 2 {
+		t.Fatalf("the keys with prefix %q hash to one server, want at least two", prefix)
+	}
+	return keys
+}
+
+// stringOnOtherServer returns a string that picks a different server than ref.
+func stringOnOtherServer(t *testing.T, servers *ServerList, ref string) string {
+	t.Helper()
+
+	refAddr, err := servers.PickServer(ref)
+	if err != nil {
+		t.Fatalf("PickServer: %v", err)
+	}
+	for i := 0; i < 1000; i++ {
+		candidate := fmt.Sprintf("%s-shard-%d", ref, i)
+		addr, err := servers.PickServer(candidate)
+		if err != nil {
+			t.Fatalf("PickServer: %v", err)
+		}
+		if addr.String() != refAddr.String() {
+			return candidate
+		}
+	}
+	t.Fatalf("no string picks a server other than the one of %q", ref)
+	return ""
+}
+
+// keyOnServer returns a key with prefix that picks the server at addr.
+func keyOnServer(t *testing.T, servers *ServerList, addr net.Addr, prefix string) string {
+	t.Helper()
+
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("%s-%d", prefix, i)
+		picked, err := servers.PickServer(key)
+		if err != nil {
+			t.Fatalf("PickServer: %v", err)
+		}
+		if picked.String() == addr.String() {
+			return key
+		}
+	}
+	t.Fatalf("no key picks the server %s", addr)
+	return ""
+}
+
+// serverIndex returns the position of addr in the server list.
+func serverIndex(t *testing.T, servers *ServerList, addr net.Addr) int {
+	t.Helper()
+
+	index, found := 0, -1
+	_ = servers.Each(func(a net.Addr) error {
+		if a.String() == addr.String() {
+			found = index
+		}
+		index++
+		return nil
+	})
+	if found < 0 {
+		t.Fatalf("the server %s is not in the list", addr)
+	}
+	return found
+}
+
+// closedAddr returns the address of a port where nothing listens.
+func closedAddr(t *testing.T) string {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return addr
 }
