@@ -894,7 +894,8 @@ type StorageMultiResult struct {
 	// not store the item anyway).
 	NotStored int
 
-	// Submitted is the number of items that we attempted to store.
+	// Submitted is the number of items that we attempted to store without
+	// encountering a terminal error (network issues, invalid response).
 	Submitted int
 
 	// ServerErrors are any errors originating from server (as opposed to
@@ -903,8 +904,10 @@ type StorageMultiResult struct {
 	ServerErrors []error
 }
 
-// Stored returns the number of items that were stored in the cache and not
-// discarded due to errors, invalid data, etc.
+// Stored returns the number of items that we know were stored in the cache
+// and not discarded due to errors, invalid data, etc. When writes encounter
+// terminal errors (network issues, invalid responses) after writing some items,
+// this may undercount the number of items that were stored.
 func (r StorageMultiResult) Stored() int {
 	return r.Submitted - r.NotStored - len(r.ServerErrors)
 }
@@ -925,7 +928,10 @@ type resultErrPair struct {
 //
 // If there are no terminal errors (network issues, invalid responses), the results
 // of writing items are returned in a result object with counts of what happened
-// to the items. If there are terminal errors, results may be incomplete.
+// to the items. If there are terminal errors, results may be incomplete. Even when
+// there are no terminal errors it may still be the case that items were not stored
+// in the cache. Callers must check the result object for counts of items that were
+// not stored or server errors encountered.
 //
 // batchSize controls how many items are written to a server at a time and must be
 // at least 1. Each batch must be written to a server within the timeout being used
@@ -936,8 +942,11 @@ func (c *Client) SetMulti(items []*Item, batchSize int, opts ...Option) (Storage
 	}
 
 	shardKey := shardKeyOf(opts)
-	itemMap := make(map[net.Addr][]*Item)
+	if !legalShardKey(shardKey) {
+		return StorageMultiResult{}, ErrMalformedKey
+	}
 
+	itemMap := make(map[net.Addr][]*Item)
 	for _, item := range items {
 		if !legalKey(item.Key) {
 			return StorageMultiResult{}, ErrMalformedKey
@@ -949,7 +958,8 @@ func (c *Client) SetMulti(items []*Item, batchSize int, opts ...Option) (Storage
 		itemMap[addr] = append(itemMap[addr], item)
 	}
 
-	// If we're only setting items on a single server there's no benefit to parallelizing it.
+	// If we're only setting items on a single server there's no benefit to parallelizing
+	// it but items will still be batched to reduced network round-trips.
 	if len(itemMap) == 1 {
 		for k, v := range itemMap {
 			return c.setAddr(k, v, batchSize)
