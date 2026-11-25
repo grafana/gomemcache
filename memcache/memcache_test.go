@@ -1551,6 +1551,19 @@ func TestWithShardKey(t *testing.T) {
 		}
 	})
 
+	t.Run("SetMulti acts on an item that sits on the server of the shard key", func(t *testing.T) {
+		key := "setmulti-key"
+		shardKey := stringOnOtherServer(t, servers, key)
+		withShardKey := WithShardKey(shardKey)
+		if _, err := c.SetMulti([]*Item{{Key: key, Expiration: 300, Value: []byte("10")}}, 1, withShardKey); err != nil {
+			t.Fatalf("SetMulti: %v", err)
+		}
+		_, err := c.Get(key, withShardKey)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	})
+
 	t.Run("GetMulti with the shard key returns the items that arrived before a server error", func(t *testing.T) {
 		type result struct {
 			items map[string]*Item

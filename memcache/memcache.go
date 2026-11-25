@@ -930,17 +930,19 @@ type resultErrPair struct {
 // batchSize controls how many items are written to a server at a time and must be
 // at least 1. Each batch must be written to a server within the timeout being used
 // and so should not be huge. A batch size of 8 to 64 is a reasonable default.
-func (c *Client) SetMulti(items []*Item, batchSize int) (StorageMultiResult, error) {
+func (c *Client) SetMulti(items []*Item, batchSize int, opts ...Option) (StorageMultiResult, error) {
 	if batchSize < 1 {
 		return StorageMultiResult{}, fmt.Errorf("batch size must be at least 1, got %d", batchSize)
 	}
 
+	shardKey := shardKeyOf(opts)
 	itemMap := make(map[net.Addr][]*Item)
+
 	for _, item := range items {
 		if !legalKey(item.Key) {
 			return StorageMultiResult{}, ErrMalformedKey
 		}
-		addr, err := c.selector.PickServer(item.Key)
+		addr, err := c.selector.PickServer(selectorKey(item.Key, shardKey))
 		if err != nil {
 			return StorageMultiResult{}, err
 		}
