@@ -355,11 +355,14 @@ func testWithClient(t *testing.T, c *Client) {
 
 		res, err := c.SetMulti(items, 4)
 		checkErr(err, "fatal error from SetMulti: %s", err)
-		if res.Submitted != numItems {
-			t.Fatalf("expected %d items to be submitted, got %d. res: %+v", numItems, res.Submitted, res)
+		if res.Stored != numItems {
+			t.Fatalf("expected %d items to be stored, got %d. res: %+v", numItems, res.Stored, res)
 		}
-		if res.Stored() != numItems {
-			t.Fatalf("expected %d items to be stored, got %d. res: %+v", numItems, res.Stored(), res)
+		if res.Failed != 0 {
+			t.Fatalf("expected %d items to be failed, got %d. res: %+v", 0, res.Failed, res)
+		}
+		if res.Rejected != 0 {
+			t.Fatalf("expected %d items to be rejected, got %d. res: %+v", 0, res.Rejected, res)
 		}
 
 		for _, item := range items {
@@ -381,6 +384,9 @@ func testWithClient(t *testing.T, c *Client) {
 		}
 
 		res, err := c.SetMulti(items, 1)
+		if res.Rejected != len(items) {
+			t.Fatalf("expected %d items to be rejected from SetMulti for invalid key, got %d. res: %+v", len(items), res.Rejected, res)
+		}
 		if err == nil {
 			t.Fatalf("expected fatal error from SetMulti for invalid key: %+v", res)
 		}
